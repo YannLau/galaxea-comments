@@ -1,47 +1,191 @@
-# Self-contained R1Pro arm plus torso data config.
+# =============================================================================
+# configs/data/r1pro_wbc.yaml — R1 Pro 双臂 + 躯干（WBC，whole-body control）数据配置
+# =============================================================================
+#
+# 【这个文件是什么】
+#   它挂在 Hydra 的 `data` 配置组下，用一份自包含（self-contained）的 YAML 描述
+#   “R1 Pro 全身控制（手臂 + 躯干）的训练数据从哪来、怎么读、怎么变成模型输入”。选择链路是：
+#       configs/train.yaml  →  configs/task/r1pro_wbc.yaml  →  configs/data/r1pro_wbc.yaml
+#   （见 configs/task/r1pro_wbc.yaml 的 defaults: `- override /data: r1pro_wbc`）
+#   注意：task 里的 `model.processor.*`、`model.model_arch.action_dim` 等会覆盖本文件里
+#   同名的处理器字段（合并规则见 src/g05/utils/data/processor_utils.py），所以本文件可以看作
+#   “R1 Pro WBC 数据的确切描述”，其中一部分处理器字段在实际训练时会由 task 再覆盖一次。
+#
+# 【与 configs/data/r1pro.yaml（纯关节空间版本）的差异】—— 只有 4 处
+#   1) 本文件多了一个 `torso`（躯干，4 维）：action 与 state 各多一条 meta。
+#   2) RelativeJointTransform 的 keys 里多了 torso → 躯干动作也学“相对增量”。
+#   3) YAML 锚点名不同：&r1pro_wbc_shape_meta（避免与 r1pro.yaml 的锚点混淆，二者是各自独立文件）。
+#   4) 示例数据目录不同：data/r1pro_wbc/stack_box_lerobot（r1pro 是 data/r1pro/fold_carton_lerobot）。
+#   ⚠️ 有意思的一点：两者的“最终训练布局”完全一样，都是 grouped 27D
+#      left_control(9) | left_gripper(1) | right_control(9) | right_gripper(1) | lower_body(7)
+#      因为 task 里用的 configs/data/parts_meta/r1pro.yaml 把 lower_body(7) 与 torso(4) 声明为
+#      “互斥备选”，组宽取两者的最大值 7 → torso 的 4 维落在该 7 维槽的前 4 维，其余 3 维标记为 padding。
+#      所以 WBC 版本可以复用同一套模型维度（action_dim/proprio_dim = 27）与 tokenizer 布局。
+#
+# 【谁读它】
+#   * 训练     : scripts/finetune.py → instantiate_dataset(cfg) 建数据集；build_processors(cfg) 建处理器
+#   * 离线评测 : scripts/eval_open_loop.py（同样走 instantiate_dataset）
+#   * 真机部署 : scripts/serve_policy*.py → 读运行目录里的 .hydra/config.yaml（即本文件解析后的结果）；
+#               experiments/r1pro 的 ROS2 客户端把 torso 当 JointState(4) 收发（见 utils/message/message_convert.py）。
+#   * 调试     : tests/show_vla_label.py（可视化一条样本）、tools/resolve_config.py（打印解析后的配置）
+#
+# 【文件三大块】
+#   1) 顶层参数            —— MixtureLerobotDataset 的构造参数：动作 chunk 长度、观测帧数、训练/验证切分…
+#   2) processors          —— 每个 embodiment 的“数据处理流水线”（shape_meta / 变换 / 归一化 / 合并方式）
+#   3) embodiment_datasets —— 每个 embodiment 的“数据来源”（数据集类、LeRobot 版本、数据目录与权重）
+#   ⚠️ 关键命名约束：`processors` 的键集合必须与 `embodiment_datasets[*].embodiment_type`
+#      完全一致，否则 build_processors 会直接抛错。
+#
+# 【一条训练样本的完整流水线】（processor.preprocess，见 base_processor.py）
+#   LeRobot 数据集 __getitem__（按 shape_meta 决定读哪些列、读多少帧）
+#     → dict{action:{...}, state:{...}, images:{...}, *_is_pad}
+#     → ① action_filter           生成 action_op_mask（标出哪些维度有效/可操作）
+#     → ② action_state_transforms 相对动作（本文件：RelativeJointTransform，含 torso）
+#     → ③ normalizer              归一化（本文件：默认 z-score-tail，夹爪用 q01/q99）
+#     → ④ action_state_merger     把 dict 对齐到固定宽度并拼成 flat tensor（同时给出 padding mask）
+#     → batch{pixel_values, proprio, action, action_dim_is_pad, …} 交给模型
+#   部署/评测时反着走 processor.postprocess：
+#     merger.backward → normalizer.backward → ②的 backward（把相对动作还原成绝对关节角/躯干位置再下发）。
+#
+# 【本文件里的 ${...} 语法】
+#   `${oc.load:文件,键}` = 读取另一个 YAML 文件的某个子树，用来复用共享定义。
+#   好处：改一处、处处生效，避免同一份配置在多处复制粘贴后走形。
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. 顶层参数（MixtureLerobotDataset 的构造参数）
+# -----------------------------------------------------------------------------
+# 【类】Hydra 用 `_target_` 指定实例化哪个类（hydra.utils.instantiate）。
+# MixtureLerobotDataset = “混合数据集”：把 1..N 个 embodiment、每个 embodiment 下 1..N 个数据集目录
+# 合成一个 Dataset，并负责按权重采样、切分训练/验证、聚合归一化统计量。
+# 训练入口里由 instantiate_dataset(cfg, is_training_set=…) 构造。
+# 注意：本文件下面的 `processors` 不是它的构造参数，会被 instantiate_dataset 剥掉，交给 build_processors 使用。
 _target_: g05.data.mixture_lerobot_dataset.MixtureLerobotDataset
+
+# 【是否归一化 dataset_group 的 weight】true = 用 normalize_dataset_weights() 把权重缩放成
+# “不改变总样本量”的相对因子，即 sum(len_i × w_i) == sum(len_i)。
+# 例：两个 group 各 100 条、原始 weight=[1,3] → 归一化后 [0.5, 1.5]（仍是 1:3 的相对偏好，但总量守恒）。
+# 只有 use_weight_for_sampling=true 时它才影响“采样长度”；否则只影响统计量聚合时的权重。
 use_weight_normalization: true
+
+# 【是否按 weight 改变采样长度】false = 每个 group 的逻辑长度就是它的真实帧数（不做加权下采样），
+# 此时 weight 只用于聚合归一化统计量时的加权平均（_aggregate_weighted_stats）。
+# true = 逻辑长度 = 真实长度 × weight（weight<1 相当于下采样，用与 epoch 相关的黄金比例步长取子集，
+#        避免每个 epoch 都取同一段前缀）。
+# 单数据集或各数据集等权时，保持 false 最简单、也最容易复现。
 use_weight_for_sampling: false
+
+# 【动作 chunk 长度 H】一次预测未来多少步动作；数据集按 shape_meta 返回 [H, 每键维度] 的张量。
+# 链路：本字段 → 数据侧 delta_timestamps 的查询长度（range(-past_action_size, action_size)）；
+#       模型侧 configs/model/g05.yaml 里 model_arch.horizon_steps: ${data.action_size} 会自动跟随；
+#       它还会进入 dataset_stats 的缓存签名，改动后归一化统计量会重新统计。
+# WBC 与纯关节空间版本这里保持一致（都是 32），便于复用同一批超参。
 action_size: 32
+
+# 【过去动作帧数】只取“当前帧之前”的历史动作。当前实现断言必须为 0
+# （见 base_lerobot_dataset.py 的 `assert past_action_size == 0`），保留该字段是为了配置自解释与将来扩展。
 past_action_size: 0
+
+# 【观测帧数 T】每个样本包含几帧观测（图像 + state）。1 = 只用当前帧（单帧策略）。
+# ⚠️ 三处必须一致：本字段、processor.num_obs_steps、模型 model_arch.cond_steps
+#   （模型侧 cond_steps: ${obs_image_steps:${data.obs_size}} 会自动读取本字段，一般不用手改）。
 obs_size: 1
+
+# 【多帧观测之间的时间间隔（秒）】仅当 obs_size > 1 时生效：
+#   obs_stride_second = 0.0 → 按 stride = 1 帧取（相邻帧）；
+#   大于 0                  → 按 stride = round(obs_stride_second × 数据帧率) 取。
+# obs_size = 1 时该字段无意义。
 obs_stride_second: 0.0
+
+# 【验证集比例】按 episode 切分：前 (1 − 比例) 个 episode 给训练，末尾若干 episode 给验证。
+# 1e-4 极小 → 实际上只有最后 1 个 episode 会进验证集（只有 episode 总数过万时才会多于 1 个）。
+# 目的：训练时用一个极小的验证子集做快速 sanity check，而不是严格的泛化评估。
 val_set_proportion: 1e-4
+
+# 【默认是否训练集】true = 取前 (1 − 验证比例) 的 episode。
+# 实际训练/评测时由脚本显式传入覆盖：finetune.py 用 is_training_set=True 建 train_dataset、
+# 用 False 建 eval_dataset；这里保留 true 是给“单独加载这份 data 配置”的场景（调试脚本等）当默认值。
 is_training_set: true
+
+# -----------------------------------------------------------------------------
+# 2. processors：每个 embodiment 的数据处理流水线
+# -----------------------------------------------------------------------------
+# 为什么数据集与处理器要分开写？
+#   * embodiment_datasets 回答“数据是什么”：文件在哪、LeRobot 版本、原始列长什么样；
+#   * processors           回答“数据怎么变成模型输入”：相对化、归一化、对齐、相机预处理。
+#
+# 运行时的合并规则（build_processors）：
+#   merged = merge(本文件 processors[embodiment_type], task 的 cfg.model.processor)
+#   task 级 model.processor 覆盖本文件同名字段；其中 `action_state_merger` 是整体替换（不逐键合并），
+#   以免残留旧的 parts_meta。
+# 因此：
+#   改“所有任务通用的处理方式”   → configs/model/g05.yaml 的 processor
+#   改“只属于本任务的处理方式”   → configs/task/r1pro_wbc.yaml 的 model.processor
+#   改“R1 Pro WBC 的原始字段/相机” → 本文件
 processors:
+  # 键名 = embodiment_type，必须与下面 embodiment_datasets.galaxea_r1pro.embodiment_type 完全一致。
+  # ⚠️ 注意这里仍然是 `galaxea_r1pro`（不是 r1pro_wbc）：WBC 与纯关节空间共用同一个 embodiment 标签，
+  #    模型侧因此把两者视作同一种机器人形态；差异只体现在实际有哪些 part（是否带 torso）。
   galaxea_r1pro:
+    # ===== shape_meta：声明“一条样本里有哪些字段、来自 LeRobot 的哪一列、维度是多少” =====
+    # YAML 锚点 &r1pro_wbc_shape_meta 把这份定义命名为 r1pro_wbc_shape_meta，
+    # 下面 embodiment_datasets 用 *r1pro_wbc_shape_meta 复用同一个对象 →
+    # 数据集读取与处理器处理永远看到同一份布局（只维护一处，不会两边写岔）。
+    #
+    # 【字段含义】action / state 条目通用：
+    #   key         : 内部键名。batch 里的 dict 键、transform 的 keys、parts_meta 的对齐名都用它，
+    #                 必须与 parts_meta / merge_spec 中的名字一致（本例：left_arm / left_gripper / torso …）。
+    #   lerobot_key : LeRobot 数据集里的真实列名（parquet 列 / 视频特征），必须真实存在，否则加载报错。
+    #   start_index : 从该列最后一维的哪个下标开始切。
+    #   raw_shape   : 切多宽 → 实际取 data[..., start_index : start_index + raw_shape]。
+    #                 本数据集每个部件已经是独立列（action.left_arm 本身就是 7 维），所以 start_index 全为 0；
+    #                 若某数据集把全身关节拼成一条长列，就要靠 start_index 挑出自己那一段。
+    #   shape       : 经过 action_state_transforms 之后交给 merger 的维度；对 action/state 一般等于 raw_shape。
+    #                 processor 会断言两次（读出来 == raw_shape；变换后 == shape），写错会立刻报错。
+    #   time_offset : 整数帧偏移，用于跨键/跨模态时间对齐（读取时按 shift_sequence_with_replication 平移）。
+    #                 0 = 不偏移。
+    # images 额外字段：
+    #   camera_type : 相机角色，取值 exterior（外部/头部视角）、wrist_left、wrist_right。
+    #                 作用：(1) 供 task 的 camera_size_config 决定该相机的最终分辨率；
+    #                       (2) 供采样/增强按相机角色区分处理。
     shape_meta: &r1pro_wbc_shape_meta
+      # ---- 监督目标：未来 action_size 帧动作 ----
+      # 原始动作 = 7(左臂关节角) + 1(左夹爪) + 7(右臂关节角) + 1(右夹爪) + 4(躯干) = 20 维，各键独立成列。
+      # 相比纯关节空间版本（configs/data/r1pro.yaml）多出的就是最后这条 torso。
       action:
-      - key: left_arm
+      - key: left_arm                      # 左臂 7 个关节角（弧度）
         lerobot_key: action.left_arm
         start_index: 0
         raw_shape: 7
         shape: 7
         time_offset: 0
-      - key: left_gripper
+      - key: left_gripper                  # 左夹爪开合宽度（1 维标量）
         lerobot_key: action.left_gripper
         start_index: 0
         raw_shape: 1
         shape: 1
         time_offset: 0
-      - key: right_arm
+      - key: right_arm                     # 右臂 7 个关节角（弧度）
         lerobot_key: action.right_arm
         start_index: 0
         raw_shape: 7
         shape: 7
         time_offset: 0
-      - key: right_gripper
+      - key: right_gripper                 # 右夹爪开合宽度（1 维标量）
         lerobot_key: action.right_gripper
         start_index: 0
         raw_shape: 1
         shape: 1
         time_offset: 0
-      - key: torso
-        lerobot_key: action.torso
+      - key: torso                         # 躯干 4 个自由度（整机“升降/俯仰”等，来自机器人 torso JointState）
+        lerobot_key: action.torso          # ⚠️ 数据集必须真的有 action.torso 这一列
         start_index: 0
         raw_shape: 4
         shape: 4
         time_offset: 0
+      # ---- 观测状态：与动作同名的 5 个键，用作 proprio（本体感受）输入，也是相对动作的基准 ----
+      # 相对动作变换会用到 state 的最后一帧：action_rel = action_abs − state[-1]，所以 state 必须与 action 逐键对齐
+      # （这里 left_arm / right_arm / torso 三条都会参与相对化）。
       state:
       - key: left_arm
         lerobot_key: observation.state.left_arm
@@ -67,14 +211,20 @@ processors:
         raw_shape: 1
         shape: 1
         time_offset: 0
-      - key: torso
+      - key: torso                         # 躯干当前姿态，既当 proprio 输入，也是躯干相对动作的基准
         lerobot_key: observation.state.torso
         start_index: 0
         raw_shape: 4
         shape: 4
         time_offset: 0
+      # ---- 三路相机（与纯关节空间版本完全一致）----
+      # raw_shape : 数据集里真实的分辨率 [C, H, W]（头部 360×640，手腕 480×640）。
+      # shape     : 模型侧目标分辨率。⚠️ 它只是“没有 camera_size_config 时的兜底值”：
+      #             task 的 model.processor.camera_size_config（本任务为 256×256）优先级更高，
+      #             会把这里覆盖成 [3, 256, 256] 并打出 “shape field … is stale” 的警告，
+      #             随后 processor 再按该分辨率自动注入 Resize。
       images:
-      - key: head_rgb
+      - key: head_rgb                     # 头部/外部视角
         camera_type: exterior
         lerobot_key: observation.images.head_rgb
         start_index: 0
@@ -87,7 +237,7 @@ processors:
         - 224
         - 224
         time_offset: 0
-      - key: left_wrist_rgb
+      - key: left_wrist_rgb               # 左手腕相机（贴近操作目标，看细节）
         camera_type: wrist_left
         lerobot_key: observation.images.left_wrist_rgb
         start_index: 0
@@ -100,7 +250,7 @@ processors:
         - 224
         - 224
         time_offset: 0
-      - key: right_wrist_rgb
+      - key: right_wrist_rgb              # 右手腕相机
         camera_type: wrist_right
         lerobot_key: observation.images.right_wrist_rgb
         start_index: 0
@@ -113,12 +263,34 @@ processors:
         - 224
         - 224
         time_offset: 0
+
+    # ===== action_state_transforms：作用在 action/state 上的结构化变换（按列表顺序 forward）=====
+    # 部署时按相反顺序执行逆变换（processor.postprocess）。
     action_state_transforms:
+    # RelativeJointTransform：把“绝对关节角/躯干位置”变成“相对最新一帧状态”的增量：
+    #     action_relative = action_absolute − state[..., -1:, :]     （state 自身不变）
+    # 目的：让策略学“该往哪动多少”而不是“目标绝对角度”，对初始位姿、场景摆放变化更鲁棒；
+    #      部署时也方便在当前关节/躯干位置附近叠加增量下发。
+    # ⚠️ 本文件（WBC）的 keys 里包含 torso —— 躯干动作同样被相对化；这是与 configs/data/r1pro.yaml 的唯一一处
+    #    变换差异（那边只有 left_arm / right_arm）。
+    # 夹爪不在此列 → 保持绝对值（开合宽度本身就有绝对含义）。
+    # 标了 invertible=True：部署链路会用它的 backward 把相对动作还原成绝对关节角。
     - _target_: g05.data_processor.transforms.relative_action.RelativeJointTransform
       keys:
       - left_arm
       - right_arm
       - torso
+
+    # ===== 图像预处理/增强：按相机 key 分别给一组 transform =====
+    # 写法 ${oc.load:configs/data/_transforms.yaml, train_head} 表示“从共享文件 _transforms.yaml 取 train_head 子树”，
+    # 这样 8 个任务的图像处理集中在一个文件里维护。
+    # 训练用 train_*（本文件只用确定性的 ToTensor + Normalize，不加随机增强），验证用 val（同样的确定性处理）。
+    # 细节（见 configs/data/_transforms.yaml）：
+    #   * ToTensor                  : uint8 HWC → float CHW，数值缩放到 [0, 1]
+    #   * Normalize(0.5, 0.5, 0.5)  : 把 [0, 1] 再线性映射到 [−1, 1]
+    #   * Resize 刻意不写在这里      : processor 会按 camera_size_config[相机角色] 自动注入（_patch_resize_per_camera），
+    #                                 所以 _transforms.yaml 里的 Resize 都是注释状态。
+    # 想加增强：把 head_rgb 换成 train_exterior（含 ColorJitter），或仿照 train_wrist_flip 之类新增一组。
     train_transforms:
       head_rgb: ${oc.load:configs/data/_transforms.yaml,train_head}
       left_wrist_rgb: ${oc.load:configs/data/_transforms.yaml,train_wrist}
@@ -127,7 +299,22 @@ processors:
       head_rgb: ${oc.load:configs/data/_transforms.yaml,val}
       left_wrist_rgb: ${oc.load:configs/data/_transforms.yaml,val}
       right_wrist_rgb: ${oc.load:configs/data/_transforms.yaml,val}
+
+    # ===== 归一化方式 =====
+    # norm_default_mode：所有 action/state 键默认使用的归一化模式。
+    #   z-score-tail = 先做“尾部压缩”（把 q01/q99 之外的长尾压扁，强度由 norm_tail_scale 控制，默认 0.075），
+    #                  再做 z-score（减均值 / 除标准差）。
+    #   好处：z-score 本身无界，不会像 min/max 那样把超范围的值直接截断；配合尾部压缩又能抑制离群点。
+    #   统计量来自 dataset_stats.json；若缓存不存在会现场统计（改动 action_size / 数据目录 / 相对动作变换会使缓存失效并重算）。
+    #   ⚠️ 归一化发生在“相对化之后”，所以 torso 的统计量是相对躯干位移的分布，与纯关节空间版本的统计量不是同一套。
     norm_default_mode: z-score-tail
+
+    # norm_exception_mode：对个别键改用别的模式，格式 {action|state: {键名: 模式}}。
+    # 这里把四个夹爪键改成 q01/q99（用 1%/99% 分位数线性映射到 [−1, 1]）。
+    # 原因：夹爪基本是“开/合”两态分布，均值和标准差描述不好这种分布，分位数更稳。
+    # torso 未列出 → 走上面的默认 z-score-tail（躯干是连续运动量，用 z-score 合适）。
+    # ⚠️ 键名必须与 shape_meta 的 key 完全一致；统计量文件里也要有对应字段
+    #   （use_stepwise_action_norm=true 时读的是 stepwise_q01/stepwise_q99）。
     norm_exception_mode:
       action:
         left_gripper: q01/q99
@@ -135,24 +322,127 @@ processors:
       state:
         left_gripper: q01/q99
         right_gripper: q01/q99
+
+    # ===== 动作过滤器 =====
+    # 作用：生成 action_op_mask —— 标出哪些动作维度是“有效/可操作”的（例如某些 embodiment 的某些关节不参与控制）。
+    # BaseActionFilter 默认把所有维度都标为 True（不屏蔽任何维度）。
+    # 它不可逆（mask 无法从 action 数值反推），所以只在 forward 方向使用。
+    # ⚠️ 在本仓库的 r1pro_wbc 训练链路里，该字段会被 configs/task/r1pro_wbc.yaml 的
+    #    model.processor.action_filter（DummyActionFilter）覆盖，语义与这里一致（全 True）。
+    #    另有按维度判断“是否真的动了”的 R1LiteJointActionFilter（见 galaxea_action_processor.py），
+    #    它把 torso/chassis 视作“速度语义”键、用绝对值判断，适用于按 part 屏蔽 noop 的场景。
     action_filter:
       _target_: g05.data_processor.transforms.action_filter.BaseActionFilter
+
+    # ===== action/state 合并器 =====
+    # PaddingActionMerger：把 dict 形式的 action/state 按 parts_meta 的顺序对齐到统一宽度，
+    # 并在 merge: true 时拼接成扁平张量，同时产出 padding mask（action_dim_is_pad / proprio_dim_is_pad）。
+    # 不同 embodiment 的部件维度不同，pad 到最大宽度后才能放进同一个 batch。
+    #
+    # max_action_shape_meta / max_state_shape_meta = “对齐用的最大布局”，这里用
+    # configs/data/parts_meta/10k_wbc.yaml 的 parts_meta 子树（`${oc.load:文件,键}`），
+    # 即全量 WBC 世界：left_arm:8 / right_arm:8 / 各夹爪:1 / torso:4 / torso.velocities:6 / ee_pose:9 /
+    # chassis / 灵巧手…；拼接顺序按该 parts_meta 的键顺序，缺失的键补零并标记 mask=True。
+    # ⚠️ 这里写的是 left_arm:8 而不是 7：R1 Pro 的 7 维手臂会被 pad 到 8 维，多出的 1 维在 mask 里标为 padding。
+    # 这是“embodiment 级默认值”；本仓库的 r1pro_wbc 训练链路会在 task 里把它整体替换成
+    #   configs/task/r1pro_wbc.yaml → model.processor.action_state_merger = GroupedPaddingMerger
+    #   + configs/data/parts_meta/r1pro.yaml
+    # 输出 grouped 27D：left_control(9) | left_gripper(1) | right_control(9) | right_gripper(1) | lower_body(7)，
+    # 其中 lower_body 槽由 torso(4) 填充（该槽宽度取 max(lower_body 7, torso 4) = 7），其余 3 维为 padding。
+    # 这也是为什么 WBC 版本能和纯关节空间版本共用 action_dim/proprio_dim = 27 与 tokenizer 布局。
     action_state_merger:
       _target_: g05.data_processor.transforms.action_state_merger.PaddingActionMerger
+      # merge: true → 合并结果是张量；false 则保持 dict（逐键仍会被对齐）
       merge: true
       max_action_shape_meta: ${oc.load:configs/data/parts_meta/10k_wbc.yaml,parts_meta}
       max_state_shape_meta: ${oc.load:configs/data/parts_meta/10k_wbc.yaml,parts_meta}
+
+    # 【每次取几帧观测】必须与数据侧 obs_size、模型侧 cond_steps 一致（本例都是 1）。
     num_obs_steps: 1
+
+    # 【动作归一化统计量的使用粒度】
+    # true  → 逐步（stepwise）：动作 chunk 内第 t 步用第 t 步自己的统计量（stepwise_* 字段），
+    #          因为 chunk 越靠后越远离当前状态、分布差异越大，逐步归一化更精确；
+    # false → 全局（global）：整个 chunk 共用一套统计量（global_* 字段）。
+    # ⚠️ 必须与 dataset_stats.json 里实际存在的字段配套，否则会回退成 dummy 归一化并告警。
     use_stepwise_action_norm: true
+
+    # 【丢弃高层指令的概率】指令由两段组成：coarse_task（高层任务描述）+ task（低层子任务描述）。
+    # 1.0 = 总是只给低层指令（[Low]: …）；0.0 = 总是给两层（[High]: …, [Low]: …）。
+    # 训练时按该概率随机取舍，使模型对不同详尽程度的指令都保持鲁棒。
     drop_high_level_prob: 1.0
+
+    # 【指令语言】Galaxea 数据集里 task 字段形如 "中文@English"：
+    # false → 取英文部分；true → 取中文部分。
     use_zh_instruction: false
+
+# -----------------------------------------------------------------------------
+# 3. embodiment_datasets：数据来源（一个或多个 embodiment）
+# -----------------------------------------------------------------------------
+# 结构：{别名: {type / embodiment_type / lerobot_ds_version / shape_meta / dataset_groups}}
+#   * 别名（这里的 galaxea_r1pro）只是本文件内的标识，可以随意命名；
+#     真正参与处理器匹配、模型 embodiment 标签的是 `embodiment_type`。
+#   * 想混合多个机器人形态时，在这里并列写多个条目，并为每个 embodiment_type 在 processors 里配一条流水线。
 embodiment_datasets:
   galaxea_r1pro:
+    # 数据集实现类。这里直接用 Galaxea 的 LeRobot 包装类；
+    # 也支持写 `config: configs/data/<其他>.yaml` 从别的 data 配置继承基础参数（见 load_embodiment_config）。
     type: g05.data.galaxea_lerobot_dataset.GalaxeaLerobotDataset
+    # embodiment 类型标签：必须与上面 processors 的键一致；
+    # 同时会出现在 batch 中（MixtureLerobotDataset.all_embodiment_types），供模型侧区分机器人形态。
+    # WBC 与纯关节空间共用 galaxea_r1pro 这个标签（差异体现在具体有哪些 part）。
     embodiment_type: galaxea_r1pro
+    # LeRobot 数据集版本：'3.0' 走 v3 读取路径（base_lerobot_datasetV3 + lerobot_dataset_v3），
+    # '2.1' 走旧路径。必须与磁盘上数据集 meta/info.json 里的 codebase_version 一致；
+    # 另外 v3 下验证集切分按 episode 计数（见 base_lerobot_dataset 的切分逻辑）。
     lerobot_ds_version: '3.0'
+    # 复用上面那份 shape_meta（同一个 YAML 锚点对象）——
+    # dataset 按它读原始列，processor 按它做变换/对齐，两边共享同一份定义。
     shape_meta: *r1pro_wbc_shape_meta
+    # 【数据目录与权重】
+    # dataset_groups 是一个列表，每个元素 = 一个数据集组：{weight, dataset_dirs}。
+    #   weight       : 相对权重，配合顶层 use_weight_* 决定采样与统计量聚合（只有一个数据集时填 1.0 即可）。
+    #   dataset_dirs : 该组包含的 LeRobot 数据集目录列表（可多个，会顺序拼接；要求列结构一致）。
+    # 路径按“启动训练时的工作目录”（通常是仓库根目录）解析，必须指向本地 LeRobot 数据集目录。
+    # ⚠️ README 明确提示：data/r1pro_wbc/stack_box_lerobot 只是示例路径，用自己的数据训练前必须替换。
+    #    该数据集必须包含躯干列（action.torso / observation.state.torso，各 4 维），否则与 shape_meta 对不上。
+    # 常用调试开关：`bash scripts/run/finetune.sh 1 r1pro_wbc --max_datasets 1`（每个组只取第 1 个目录）、
+    #              `--dataset <其他 data 配置>` / `--mixture <其他 data 配置>` 临时换数据。
+    # GalaxeaLerobotDataset 需要数据集提供这些列：observation.state.*、action.*、
+    # observation.images.{head_rgb,left_wrist_rgb,right_wrist_rgb}，以及 task / coarse_task / task_index
+    # （task_index 用于按时间偏移取 future_task；见 galaxea_lerobot_dataset._build_delta_timestamps）。
+    # 因此换数据集时，务必保证 shape_meta 里的 lerobot_key 与数据集实际的 feature 名一一对应。
     dataset_groups:
     - weight: 1.0
       dataset_dirs:
       - data/r1pro_wbc/stack_box_lerobot
+
+# =============================================================================
+# 常见修改点 / 自检清单
+# =============================================================================
+#  1) 换自己的数据      → 替换 dataset_groups.dataset_dirs；确认磁盘上是 LeRobot 3.0 目录结构，
+#                         且带有 action.torso / observation.state.torso 列（WBC 特有）。
+#  2) 只用手臂不用躯干  → 删掉 action/state 的 torso 条目与 RelativeJointTransform 的 torso，
+#                         或直接改用 configs/data/r1pro.yaml。
+#  3) 加一个相机        → shape_meta.images 增一条（key/camera_type/lerobot_key/raw_shape/shape），
+#                         并在 train_transforms / val_transforms 里为它补一条 transform；
+#                         若分辨率要与其他相机不同，再到 task 的 camera_size_config 里加对应 camera_type。
+#  4) 改动作 chunk 长度 → 只改 action_size（模型 horizon_steps 与统计量缓存会自动跟随）。
+#  5) 改相对/绝对动作   → 增删 action_state_transforms 里的 keys；改完记得重算归一化统计量。
+#  6) 让躯干走“速度/底盘”语义 → 需要 parts_meta/merge_spec 与 transform 配套改动
+#                         （可参考 configs/data/parts_meta/10k_wbc.yaml 与 transforms/misc.py 的 ConcatKeysTransform）。
+#
+# 改完建议跑一遍（都能在不起训练的情况下暴露配置错误）：
+#   python tools/resolve_config.py r1pro_wbc --key data.processors
+#   python tools/resolve_config.py r1pro_wbc --key model.model_arch
+#   bash scripts/run/finetune.sh 1 r1pro_wbc --dry-run --max_datasets 1
+#
+# 相关文件与文档：
+#   configs/task/r1pro_wbc.yaml                    本任务的入口配置（超参 + 覆盖处理器/模型维度）
+#   configs/data/r1pro.yaml                        纯关节空间版本，对照阅读差异最小
+#   configs/data/_transforms.yaml                  共享图像 transform 定义
+#   configs/data/parts_meta/{10k_wbc,r1pro}.yaml   action/state 布局与 merge_spec（torso→lower_body 的规则在这里）
+#   src/g05/data/mixture_lerobot_dataset.py        顶层参数的实现与语义
+#   src/g05/data/base_lerobot_dataset.py           shape_meta 如何被读取、切分、校验
+#   src/g05/data_processor/processor/base_processor.py   流水线顺序与前后处理
+#   docs/architecture/config_zh.md, docs/architecture/parts_meta_zh.md, configs/QUICK_START_zh.md

@@ -1,19 +1,167 @@
-# R1 Pro GBench grouped layout.
-# Grouped output layout:
-#   left_control(9) | left_gripper(1) | right_control(9) | right_gripper(1) | lower_body(7)
-parts_meta:
-  left_arm: 7
-  right_arm: 7
-  left_gripper: 1
-  right_gripper: 1
-  left_ee_pose: 9
-  right_ee_pose: 9
-  lower_body: 7
-  torso: 4
+# =============================================================================
+# configs/data/parts_meta/r1pro.yaml — R1 Pro 的 action/state「对齐布局表」
+# =============================================================================
+#
+# 【这个文件是什么】
+#   它既不是数据集配置，也不是模型配置，而是一张**布局定义表**，只回答两个问题：
+#     1) parts_meta : 一条样本里可能出现哪些 part（身体部位）、每个 part 多少维；
+#     2) merge_spec : 这些 part 里哪些是“互斥备选”（例如同一只手臂，要么给关节角、
+#                     要么给末端位姿），以及最终拼成几个组、按什么顺序拼。
+#   它本身不会直接被实例化，而是被 task 配置用 OmegaConf 的 ${oc.load:文件,键} resolver
+#   把子树摘出来，交给数据侧的动作/状态合并器（configs/task/r1pro.yaml 与
+#   configs/task/r1pro_wbc.yaml 的 model.processor.action_state_merger）：
+#     max_action_shape_meta: ${oc.load:configs/data/parts_meta/r1pro.yaml,parts_meta}
+#     max_state_shape_meta:  ${oc.load:configs/data/parts_meta/r1pro.yaml,parts_meta}
+#     merge_spec:            ${oc.load:configs/data/parts_meta/r1pro.yaml,merge_spec}
+#   ⚠️ 注意 action 与 state 引用的是**同一张表**：动作与本体感受的拼接布局必须逐键一致，
+#      否则“相对动作 = 动作 − 当前状态”这类按维相减的变换会直接错位。
+#
+# 【谁读它 / 什么时候生效】
+#   * 实例化它的类：g05.data_processor.transforms.action_state_merger.GroupedPaddingMerger
+#     （src/g05/data_processor/transforms/action_state_merger.py）；
+#     它内部调用 src/g05/tokenizer/utils/parts_meta_utils.py 的
+#     compute_grouped_layout / compute_grouped_dims / compute_grouped_keys，
+#     在初始化时就把本文件的两段定义展开成“输出布局 + 每个槽位的宽度”。
+#   * 生效时机：训练（scripts/finetune.py → build_processors）、离线评测
+#     （scripts/eval_open_loop.py）、真机服务（scripts/serve_policy*.py）都会经过它。
+#   * 引用者：configs/task/r1pro.yaml、configs/task/r1pro_wbc.yaml。
+#     另外 configs/data/parts_meta/r1lite.yaml 与本文件内容完全相同（只有首行注释不同），
+#     因为 R1 系列共用同一套“双臂 + 下半身”对齐空间。
+#   * 概念与数据流见 docs/architecture/parts_meta_zh.md。
+#
+# 【它和 shape_meta 的区别（新手最容易混淆的一点）】
+#   configs/data/<task>.yaml 里的 shape_meta 描述“数据集里真实存在哪些列、各多少维”；
+#   本文件的 parts_meta 描述“merger 要把这些列对齐/拼接成多大的布局”。
+#   两者不必相等：例如 R1 Lite 数据的手臂列只有 6 维，而这里的对齐宽度写的是 7 维，
+#   缺的那 1 维由 merger 补 0 并把该维标记为 padding（统计/训练时按 mask 忽略）。
+#   一句话：shape_meta 是“输入长什么样”，本文件是“输出摆成什么样”。
+#
+# 【输出是什么】
+#   merge_spec 的 5 个组按书写顺序拼成一条扁平向量，共 27 维：
+#     left_control(9) | left_gripper(1) | right_control(9) | right_gripper(1) | lower_body(7)
+#   同时产出等长的 padding mask（action_dim_is_pad / proprio_dim_is_pad）。
+#   processor 还会把这个布局（action_parts_meta）一起交给模型侧
+#   （src/g05/data_processor/processor/base_processor.py），模型再把它与
+#   tokenizer.vq_config.parts_meta 对齐：不一致时用
+#   src/g05/tokenizer/utils/parts_meta_padding.py 把数据侧布局 pad 到 tokenizer 布局，
+#   前提是“数据侧布局是 tokenizer 布局的子集”（组名相同、宽度不超标）。
+#
+# 【改动前必读】本表有“三处必须同步”的硬约束，见文末「改动指南与风险」。
+# =============================================================================
 
+# -----------------------------------------------------------------------------
+# 1. parts_meta：候选 part 的维度表（merger 的对齐目标）
+# -----------------------------------------------------------------------------
+# 键 = part 名。必须与数据配置 shape_meta 里的 key 完全一致，否则 merger 认不出来，
+#      在“互斥候选”里会把它当成不存在（该组要么换用别的候选，要么整组填 0）。
+# 值 = 该 part 在对齐空间里的宽度，不一定等于数据集真实维度（见文件头说明）。
+# 顺序 = 没有被任何 merge_spec 组覆盖的键，在输出向量里的追加顺序。
+#        本文件 8 个键全部被 merge_spec 覆盖，所以输出顺序完全由下面的 merge_spec 决定。
+# 注意：这里的书写顺序保持了原始定义（双臂关节角 → 夹爪 → 末端位姿备选 → 下半身/躯干），
+#       只有在“某个键没有被任何 merge_spec 组覆盖”时，这个顺序才会影响输出（作为残余键追加在后）。
+parts_meta:
+  # ── 双臂关节角：R1 Pro / R1 Lite 数据实际使用的表示 ──
+  left_arm: 7        # 左臂关节角（弧度）。R1 Pro 数据是 7 维；R1 Lite 数据只有 6 维，
+                     # 缺的维度由 merger 补 0 并标记为 padding。
+  right_arm: 7       # 右臂关节角（弧度），语义同 left_arm
+  # ── 夹爪：1 维开合宽度 ──
+  left_gripper: 1    # 左夹爪开合度。key 名里含 "gripper"，会额外命中 tokenizer 的
+                     # rule_based_key_patterns，因此走“二值化 + 规则编码”而不是 VQ-VAE。
+  right_gripper: 1   # 右夹爪，同上
+  # ── 末端位姿备选：本仓库的 r1* 数据都不使用，只为“对齐空间”留宽 ──
+  left_ee_pose: 9    # 左臂末端位姿备选（9 维，具体分量定义由提供该列的数据集决定）。
+                     # r1pro / r1lite 数据里都没有这个 key —— 它在这里的作用是把“对齐空间”垫宽，
+                     # 让同一套布局也能容纳“给末端位姿而不是关节角”的 embodiment
+                     # （例如 bridge / libero 用的是 right_ee_pose），从而共用同一个动作 tokenizer。
+  right_ee_pose: 9   # 右臂末端位姿备选，语义同 left_ee_pose
+  # ── 下半身 / 躯干：二者互斥地占用同一个槽位 ──
+  lower_body: 7      # 下半身 7 维（升降 / 腰 / 俯仰等整机非手臂自由度）。
+                     # ⚠️ r1pro（纯关节空间）数据集里没有这个 key ⇒ 该组 7 维恒为 0，
+                     #    并且整组被标记为 padding，等价于“这部分不参与控制”。
+  torso: 4           # 躯干 4 个自由度。只有 r1pro_wbc 的数据集带 action.torso /
+                     # observation.state.torso 列，用来填上面那个 7 维槽（前 4 维有效，后 3 维 padding）。
+
+# -----------------------------------------------------------------------------
+# 2. merge_spec：互斥备选的分组表（决定输出布局的组名、宽度与顺序）
+# -----------------------------------------------------------------------------
+# 格式：{组名: [候选 raw key, ...]}
+# 规则（实现见 compute_grouped_layout / GroupedPaddingMerger._forward_one）：
+#   * 组宽 = max(候选 key 在 parts_meta 里的宽度)。取最大而不是取第一个，
+#     是为了让同一个 batch 里用不同候选的样本都能放得下（跨 embodiment 混训的常见情况）。
+#   * 前向时在该组的候选里取“第一个真实存在（非虚拟零填充）”的 key，其余候选忽略；
+#     如果所有候选都不存在（例如 r1pro 的 lower_body / torso），则填 0 并把整组标记为 padding。
+#   * 候选顺序 = 优先级；组名会直接成为输出布局的名字，也就是 tokenizer.vq_config.parts_meta
+#     里的 key，因此组名不能随意改：它是数据侧与 tokenizer 侧的“接头”。
+#   * 书写顺序 = 扁平向量里的拼接顺序 = tokenizer 看到的 key 顺序。
+# 与 configs/data/parts_meta/10k_wbc.yaml 的区别：那份用“组 → 槽 → 备选”的三级写法
+# （服务于整机 WBC 的 12 个 part），本文件用更简单的两级写法，5 个组刚好覆盖 8 个 part。
 merge_spec:
+  # 左臂控制：关节角(7) 或 末端位姿(9) → 组宽取 9。
+  # r1pro / r1lite 实际给的是关节角 7 维 ⇒ 先补到 9（末端那 2 维标记为 padding）。
   left_control: [left_arm, left_ee_pose]
+  # 左夹爪：只有一个候选，组宽 1（1 维开关量，不走 VQ-VAE）
   left_gripper: [left_gripper]
+  # 右臂控制：语义同 left_control
   right_control: [right_arm, right_ee_pose]
   right_gripper: [right_gripper]
+  # 下半身槽：7 维的 lower_body 或 4 维的 torso → 组宽取 7。
+  #   * r1pro（纯关节空间）：两个 key 都不存在 ⇒ 7 维全 0 + 整组 padding；
+  #   * r1pro_wbc         ：只有 torso(4) ⇒ 填前 4 维，后 3 维 padding。
   lower_body: [lower_body, torso]
+
+# -----------------------------------------------------------------------------
+# 3. 展开后的实际结果（把上面两段定义算一遍，便于对照与自检）
+# -----------------------------------------------------------------------------
+# 输出布局（顺序 = merge_spec 书写顺序；宽度 = 各组组宽）：
+#   left_control(9) | left_gripper(1) | right_control(9) | right_gripper(1) | lower_body(7) = 27 维
+#
+# 各任务下每个槽位的实际情况：
+#   槽位            宽度   r1pro（关节空间）                  r1pro_wbc（含躯干）
+#   left_control      9    left_arm 7 维 + 2 位 padding       同左
+#   left_gripper      1    真实数据                          真实数据
+#   right_control     9    right_arm 7 维 + 2 位 padding      同左
+#   right_gripper     1    真实数据                          真实数据
+#   lower_body        7    全 0 + 整组 padding                torso 4 维 + 3 位 padding
+#
+# 这 27 维必须与下面三处保持一致（任何一处改了都要同步）：
+#   1) model.model_arch.action_dim / proprio_dim = 27（configs/task/r1pro.yaml）；
+#   2) tokenizer.vq_config.parts_meta = {left_control: 9, left_gripper: 1, right_control: 9,
+#      right_gripper: 1, lower_body: 7}（同一个 task 配置的 tokenizer 一节）；
+#   3) 数据配置 shape_meta 里出现的每个 key，都要能在本文件 parts_meta 里找到。
+#
+# 附带影响：正因为这 27 维里有 padding 位，tokenizer 侧的 dropout_noop_parts: true
+# 会把“整组都是 padding”的 part（r1pro 的 lower_body）直接从动作 token 序列里丢掉，
+# 于是关节空间任务的 token 序列更短，也不会为不存在的部位浪费 token。
+
+# -----------------------------------------------------------------------------
+# 4. 改动指南与风险
+# -----------------------------------------------------------------------------
+# 【只希望某些 part 可选（互斥）】把候选写进同一个组即可。configs/data/parts_meta/10k_wbc.yaml
+#   就是这么把“夹爪(gripper)”与“灵巧手(hand)”放在同一个 end_effector 槽里的：
+#     parts_meta:  {left_hand: 12, ...}
+#     merge_spec:  left_gripper: [left_gripper, left_hand]   # 组宽随之变成 max(1, 12) = 12
+#   ⚠️ 组宽变化会改变 27 维布局 ⇒ tokenizer.vq_config.parts_meta 必须同步改成同样的宽度，
+#      且与已有动作 tokenizer 权重、已有 VLA checkpoint 都不再兼容。
+#
+# 【新增一个独立 part（不互斥）】只加进 parts_meta，不要写进 merge_spec，
+#   它会作为“残余键”按 parts_meta 顺序追加到输出向量的最后；
+#   同时要改数据侧 shape_meta、tokenizer.vq_config.parts_meta 与 model_arch.action_dim。
+#
+# 【只想调整某部分的宽度】改 parts_meta 里的数值即可，但要知道三种后果：
+#   * 数值 > 数据真实维度 ⇒ 补 0 + padding mask（正常用法，例如 R1 Lite 的 6 → 7）；
+#   * 数值 < 数据真实维度 ⇒ merger 直接截断（信息丢失，且不会报错）；
+#   * 组宽变了 ⇒ action_dim / tokenizer parts_meta 必须跟着改。
+#
+# 【改完怎么验证】
+#   python tools/resolve_config.py r1pro --key data.processors     # 看合并后的 merger 配置
+#   python tools/resolve_config.py r1pro --key model.model_arch    # 看 action_dim / proprio_dim
+#   python tests/show_vla_label.py --task r1pro                    # 可视化一条样本的 action/state 布局
+#   再对照 configs/task/r1pro.yaml 的 tokenizer.vq_config.parts_meta 是否组名同宽同序。
+#
+# 【风险速查】
+#   * 改组名 ⇒ 数据侧布局名与 tokenizer 布局名对不上，模型侧 pad / unpad 会失败或静默错位；
+#   * 改组宽或增删候选 ⇒ 27 维布局变化 ⇒ 旧动作 tokenizer 与旧 VLA 权重都不再兼容；
+#   * 本文件只负责“布局对齐”，不负责归一化 / 相对化 / 相机 / 数值变换 ——
+#     那些都在 configs/data/r1pro.yaml 的 processors 里配置（相对动作变换、
+#     GroupedPaddingMerger、归一化模式等）。
+# =============================================================================

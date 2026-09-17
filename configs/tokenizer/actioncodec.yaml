@@ -1,31 +1,220 @@
-# Single ActionCodec tokenizer config for G0.5 post-training.
+# =============================================================================
+# configs/tokenizer/actioncodec.yaml
+# 动作 Tokenizer（ActionCodec / ActionCodecV2）配置 —— G0.5 后训练唯一的动作离散化入口
+# =============================================================================
+#
+# 【这个文件解决什么问题】
+#   VLM 只会处理「token（整数 id）」，但机器人动作是「连续浮点数」。所以要训练/推理之前，
+#   必须先把动作变成 token（encode），模型生成完之后再把 token 还原成连续动作（decode）。
+#   本文件就是描述这个「动作编解码器」的全部参数：分词布局、每个 part 多少维、VQ 码本多大、
+#   网络结构、权重文件在哪、要不要按 block 生成等。
+#
+# 【文件在配置树里的位置 / 谁加载它】
+#   configs/train.yaml                                  ← 训练/评测/部署共用的顶层入口
+#     └── configs/task/<task>.yaml                      ← 例如 r1pro：`- override /tokenizer: actioncodec`
+#           └── configs/tokenizer/actioncodec.yaml      ← 本文件（唯一的 tokenizer 配置入口）
+#
+#   另外 configs/train.yaml 结尾把本文件整体复制到 model 下（桥接）：
+#     model:
+#       tokenizer: ${tokenizer}
+#   于是模型侧可以读到（见 configs/model/g05.yaml 的注释）：
+#     action_tokenizer: ${model.tokenizer._target_}    # 前端类路径
+#     AT_CONFIG:        ${model.tokenizer.vq_config}   # 交给前端类的构造参数
+#   好处：task 层覆盖 tokenizer.vq_config.* 时两处永远一致，不会出现“改了 A 忘了 B”。
+#
+# 【运行时实例化流程】（想追代码时按这个顺序看）
+#   1) G05Policy.__init__            src/g05/models/g05/g05_policy.py
+#        把 action_tokenizer(_target_) 与 AT_CONFIG(vq_config) 传给 InputPreprocessor
+#   2) InputPreprocessor             src/g05/models/g05/io/input_preprocessor.py
+#        按 _target_ 实例化：VQActionTokenizer(vq_config=AT_CONFIG, vocab_offset=注册前的词表长度)
+#        —— 也就是说动作 token 的起始 id 由「运行时词表长度」决定，不在本文件里写死。
+#   3) VQActionTokenizer.__init__    src/g05/tokenizer/interface/vq_base.py
+#        再按 vq_config.vqvae_type 实例化后端，并按 vq_config.ckpt_dir 加载 VQ-VAE 权重。
+#
+# 【三/四个角色的分工】（看懂这张表，读代码时就不会迷路）
+#   | 角色                  | 代码位置                                                              | 职责 |
+#   |-----------------------|-----------------------------------------------------------------------|------|
+#   | 前端 VQActionTokenizer | src/g05/tokenizer/interface/vq_base.py                                | 连续动作 ↔ action index ↔ 词表 token id |
+#   | 序列化器 serializer    | src/g05/tokenizer/interface/serialization.py                          | 多个 part 的 code 如何排成一条 token 序列 |
+#   | 后端 ActionCodecV2…    | src/g05/tokenizer/models/actioncodec2_v2/wrapper.py                   | 真正的 VQ-VAE 编解码 + part 分组/切分 |
+#   | 规则路径 gripper 编码   | src/g05/tokenizer/models/binary_sequence/constrained_tokenizer.py      | 夹爪这类 1 维开关信号的专用编码 |
+#
+# 【一次 encode 的数据流】（维度用本文件的默认值举例）
+#   action 张量 (B, T=32, 20)
+#     → 按下面的 parts_meta 顺序切成 4 个 key：
+#          left_control(9) | left_gripper(1) | right_control(9) | right_gripper(1)
+#     → 「规则路径」：key 名里含 "gripper" 的（left/right_gripper）先二值化，
+#        再用规则编码器压成 2 个 token/key（它比 VQ 更省、且天然保证开关的连续性）
+#     → 「NN 路径」：left_control / right_control 补齐到 max_component_dim=9 后送 VQ-VAE，
+#        每个 key 产出 n_codebooks(4) × code_len(8) = 32 个 code
+#     → 拼成一条 **68** 个 index 的序列（前端 code_parts 给出的长度）
+#     → 每个 index 加 vocab_offset 变成词表 token id（例如 <action0007>），交给 VLM 训练/生成
+#   decode 完全反向：token id → index → 各 key 的 code → VQ-VAE 解码 → (B, T=32, 20) 连续动作
+#
+# 【本配置推导出的关键数字】（改动下面任何一项都要重新核对这几个数字！）
+#   code_a  = max_component_dim - conv_in_action_kernel + 1 = 9 - 2 + 1 = 8   # 动作轴被 conv_in 压掉 1 维
+#   code_h  = horizon / horizon_patch_size / (各 stride_h 连乘) = 32/8/1/2/2 = 1
+#   tokens_per_key = code_h × code_a × n_codebooks = 1 × 8 × 4 = 32
+#   NN keys  = 2（left_control, right_control） → 2 × 32 = 64 个 token
+#   rule keys = 2（两个 gripper）→ 每个 2 个 token → 共 4 个 token
+#   ⇒ 每个动作 chunk 共 68 个 action token；BAR(block_size=4) ⇒ 68/4 = 17 个 block
+#   词表新增：<action0000>…<action4095>（4096 个码本 token）
+#             + <bos_blk>/<eos_blk>/<pad_action_token> 3 个 BAR 结构 token（因为开了 block_wise_autoregressive）
+#
+# 【读文件前需要知道的 YAML/Hydra 小知识】
+#   * `_target_` 是 Hydra 的约定：表示“这个配置要实例化哪个类”（hydra.utils.instantiate）。
+#   * 以 `_` 开头的键不是数据，是给 Hydra 看的元信息。
+#   * 本文件这一层本身没有缩进，所有键都挂在 `tokenizer`（以及桥接出来的 `model.tokenizer`）之下，
+#     所以命令行覆盖要写成 `tokenizer.vq_config.<键>=<值>` 这种带前缀的形式。
+# =============================================================================
+
+# 【前端类】做「连续动作 ↔ token」转换的外层适配器，负责：
+#   * 把新动作 token 注册进 HF 词表（TokenRegistry/InputPreprocessor 调用）
+#   * encode：按下面的参数调后端 VQ-VAE，再用 serializer 把多个 key 的 code 拼成一条序列
+#   * decode：把模型生成的 token 序列还原成连续动作（并处理被跳过的 part）
+# 相关文档：docs/architecture/tokenizer.md（英文）、docs/architecture/tokenizer_zh.md（中文）
 _target_: g05.tokenizer.interface.vq_base.VQActionTokenizer
+
+# 【vq_config】= 上面这个类构造时的参数字典（即代码里的 `vq_config`）。
+#   它内部混合了三种东西，读的时候可以分层看：
+#     (a) 前端通用开关   —— vqvae_type / block_wise_autoregressive / block_size / use_extra_tokens / action_template
+#     (b) 后端 VQ-VAE 设置 —— parts_meta / rule_based_* / ckpt_dir / model_arch
+#     (c) 可选的高级开关   —— 例如 num_residuals、use_group_markers、dropout_noop_parts 等，见文件末尾说明
 vq_config:
+  # 【后端类路径】真正做动作量化的 VQ-VAE 包装类。前端只按这个字符串去实例化它：
+  #   self.action_tokenizer = get_obj_from_str(vqvae_type)(vq_config)
+  # 换成别的量化后端（例如换成 FSQ 版本）时改这一行即可，前端接口保持不变。
   vqvae_type: g05.tokenizer.models.actioncodec2_v2.wrapper.ActionCodecV2Wrapper
+
+  # 【是否按 block 做自回归（BAR, Block-wise AR）】true = 训练/推理都以「一个 block」
+  # 为最小生成单位，而不是逐个 token 生成：
+  #   * 训练侧：bar_builder.py 把动作序列切成 block，块内用双向注意力、块间用因果注意力，
+  #             并插入 <bos_blk>（块序列开始）与 <eos_blk>（块序列结束）标记，短块用 <pad_action_token> 补齐；
+  #   * 推理侧：一次前向并行算出 block_size 个 token（见 ar_helper._infer_single / mask_helper 注释），
+  #             因此 17 个 block 只需 17 次前向，比 68 次逐 token 生成快得多。
+  # 代价：同一个 block 内的 token 互相看不到“生成顺序”，block 越大越快但越难学。
+  # 注意：task 层大多会覆盖成 false（configs/task/{r1pro,r1lite,libero,robotwin,so100}.yaml 都是 false，
+  #       只有 bridge 保持 true），所以这里的 true 只是本默认档的取值，并非所有任务都走 BAR。
   block_wise_autoregressive: true
+
+  # 【是否把动作 token 作为“新增词”注册进 HF 词表】（vq_base._init_flat_tokens）
+  #   true  → 新增 <action0000>…<action4095> 等可读 token，起始 id = vocab_offset（注册前的词表长度），
+  #           随后 InputPreprocessor 会 resize embedding。新增 token 的权重是随机初始化/由 ckpt 载入的。
+  #   false → 不扩词表，而是复用词表末尾的 id（映射式：id = hf_vocab_size-1-fast_skip_tokens-action_idx），
+  #           省显存、不需要 resize，但动作 token 会“占用”原有 token id，且必须靠 config 记录 fast_skip_tokens。
+  # 本仓库默认 true：动作 token 独立可读，便于调试与可视化。
   use_extra_tokens: true
+
+  # 【BAR 的 block 大小】= 每个 block 里的 action token 数，不整除时代码会向上取整并用 <pad_action_token> 补齐：
+  #   num_block = ceil(action_token_len / block_size) = ceil(68/4) = 17
+  # 建议让 block 边界与语义边界（某个 key 的某个残差层）对齐，否则一个 block 里会混进不同语义的 code。
+  # AR 侧还有一处硬性约束说明（block 与 residual index 的关系）见
+  #   src/g05/tokenizer/interface/serialization.py → PartSignSerializer.build_block_io 的注释。
+  # ⚠️ 该值只在 block_wise_autoregressive=true 时生效。
   block_size: 4
+
+  # 【part 布局：动作/状态被切成哪些 key、每个 key 多少维】——本文件最重要的一项！
+  #   * 后端用它把扁平动作切成多个 key（wrapper.key_dims），key 顺序 = 这里的书写顺序 =
+  #     扁平向量里的拼接顺序（也就是数据侧 GroupedPaddingMerger 的输出顺序）。
+  #   * 必须与数据侧一致：configs/data/parts_meta/dual_arm_grouped_0409.yaml 的
+  #     `left_control(9) | left_gripper(1) | right_control(9) | right_gripper(1) = 20 维`，
+  #     也要与 configs/model/g05.yaml 的 model_arch.action_dim / proprio_dim = 20 一致。
+  #   * 名字里有 "gripper" 的 key 会走规则路径（见下面的 rule_based_key_patterns），
+  #     其余（left_control / right_control）走 VQ-VAE。
+  #   * 也支持写成 key_dims / merge_spec 等别名，见 wrapper._build_model 的优先级说明。
+  #   * task 层常用覆盖：r1pro / r1lite / r1pro_wbc / libero_ar 会追加 lower_body: 7（共 27 维）；
+  #     其余任务（libero / robotwin / droid / bridge / so100）沿用本文件的 20 维布局。
+  #     改动本项 = 改变 token 序列长度与含义 ⇒ 与已有 action_tokenizer 权重不兼容，必须重训 tokenizer。
   parts_meta:
-    left_control: 9
-    left_gripper: 1
-    right_control: 9
-    right_gripper: 1
+    left_control: 9    # 左臂控制（8 维关节 或 9 维末端位姿，由数据侧 merge_spec 决定取哪个）
+    left_gripper: 1    # 左夹爪开合，1 维标量（开关型信号）
+    right_control: 9   # 右臂控制
+    right_gripper: 1   # 右夹爪开合
+
+  # 【哪些 key 走“规则路径”而非神经网络】按子串匹配：只要 key 名包含列表里任一子串就走规则路径。
+  #   "gripper" ⇒ left_gripper / right_gripper 被命中。
+  # 为什么特殊处理：夹爪是近似二值的开关信号，用「约束式二值序列编码器」可以无损、几乎不占 token
+  # （本配置每个 gripper 只需 2 个 token），而且生成时不容易出现抖动/中间值。
+  # 若要改成 NN 学习，把这里设成 []（或不写）即可，但那样夹爪也会走 VQ，token 数会变多。
   rule_based_key_patterns:
   - gripper
+
+  # 【规则二值序列的连续性约束】禁止出现长度 ≤ 该值的“中间段”（既非首段也非末段的一小段翻转）。
+  #   1 ⇒ 不允许长度为 1 的孤立翻转（去抖动最常见取值）。
+  # 上调会让合法序列更少、编码更短，但也会限制夹爪能表达的快速开合模式。
   rule_based_min_block_len: 1
+
+  # 【规则路径二值化的阈值】连续值 >= 该阈值 → 1（张开），否则 → 0（闭合）。
+  # 这里的动作已由数据侧处理器做归一化（夹爪通常归一化到 [-1, 1]），
+  # 因此 0.0 表示“以 0 为界”：正数算张开、负数算闭合。
   rule_based_binarize_threshold: 0.0
+
+  # 【后端权重文件路径】动作 tokenizer（VQ-VAE）自己的 checkpoint，**不是** VLA/模型 checkpoint。
+  #   * 只在 wrapper 的 eval=True（默认）时被加载：self.load_model(ckpt_dir)。
+  #   * 文件里除权重外通常还带 tokenizer_meta.parts_meta；若本文件没有显式 parts_meta，
+  #     就会用 checkpoint 里的布局（见 wrapper.load_model 的分支）。本文件显式写了 parts_meta，
+  #     所以配置优先、checkpoint 里的布局只作为日志参考。
+  #   * 训练脚本会把该文件复制到输出目录；部署时 ckpt_utils 会自动改写成运行目录里的
+  #     action_tokenizer.pt（见 src/g05/utils/checkpoint/ckpt_utils.py），所以部署不必依赖训练机路径。
+  #   * 这里写的是本地相对路径；task 层可覆盖成 HF 上的路径（例如 configs/task/libero_ar.yaml 用
+  #     OpenGalaxea/G05/action_tokenizer.pt）。
   ckpt_dir: checkpoints/action_tokenizer.pt
+
+  # ===========================================================================
+  # 【model_arch】VQ-VAE 的网络结构参数，会被原样展开成
+  #   ActionCodecV2Config(**model_arch)  # src/g05/tokenizer/models/actioncodec2_v2/configuration_actioncodec2v2.py
+  # 简化的形状流向（本配置的实际数值）：
+  #   {key: (B, 32, D_i)} → 补齐/截断到 max_component_dim=9 → (B, 32, 9)
+  #     → 沿时间轴做分块 DCT（block=8，去时间相关性）
+  #     → pretransform：32 帧重排成 lh=8 × h=4 的二维网格 → (B, lh=8, h=4, a=9)
+  #     → conv_in（把 lh 当通道，kernel=(1,2)）把动作轴 9 → 8 → (B, 256, 4, 8)
+  #     → Encoder（3 个 stage：h 4→4→2→1，动作轴不再降维）→ (B, 128, 1, 8) → 展平成 (B, 128, 8)
+  #     → RVQ（4 层残差码本）→ codes (B, 4, 8) = 每个 key 32 个 token
+  #     → Decoder（镜像结构）→ conv_out 把动作轴 8 → 9 → 逆 DCT → 切回原始 D_i
+  # 每个参数下面标注了「调大的后果」，便于按需权衡。
+  # ===========================================================================
   model_arch:
+    # 【单个 part 的最大维度】所有 key 都会补齐/截断到这个宽度再送进同一个网络。
+    # 本配置 = 9，正好是 left_control/right_control 的维度（数据侧 control 取 max(8 维关节, 9 维位姿)=9）。
+    # 调大：能容纳更宽的动作向量，但 token 数（code_a）与计算量上升；调小：宽 part 会被截断（信息丢失）。
+    # ⚠️ 该值必须 ≥ 所有 NN part 的实际维度，且应与数据侧「最大 part 维度」对齐。
     max_component_dim: 9
+
+    # 【动作 chunk 长度 H】一次编码多少步未来动作，必须与数据配置的 action_size 一致
+    # （configs/data/*.yaml 都是 32），否则 encode 时会因时间轴长度不符而报错或产生错位。
     horizon: 32
+
+    # 【时间轴分块大小】horizon 需要能被它整除（代码里有 assert）。
+    # pretransform 会把 horizon 重新排成 (lh=horizon/horizon_patch_size, h=horizon_patch_size)，
+    # 其中 lh 被当作 conv_in 的“通道”数 → 因此它也等于 conv_in 的 in_channels。
+    # 默认 32/8 → lh=8, h=4，再由 strides 把 h 压到 1，得到 code_h=1（时间轴最终只剩 1 个位置）。
     horizon_patch_size: 8
+
+    # 【conv_in 在动作轴上的卷积核宽度】动作轴 A: max_component_dim → max_component_dim-k+1。
+    # 设 2 的目的是把 9 变成 8（2 的幂），让后续张量更规整、也更省显存。
+    # 若改成 1，则 code_a=9（动作轴不压缩，token 数变多）；改成 >2 会丢更多维度的相邻信息。
     conv_in_action_kernel: 2
+
+    # 【基础通道数】conv_in 的输出通道，也是 encoder 第一层宽度。
+    # 各 stage 的实际宽度 = encoder_channels × c_mults[i]。
+    # 这是 decoder/encoder 两侧共用的基础宽度：调大 → 编解码更精确但参数/显存显著上升。
     encoder_channels: 256
+
+    # 【潜在维度 latent_dim】编码器最后投影到的通道数，也是 RVQ 的输入维度。
+    # 调大信息容量更强但码本更难学；调小会形成瓶颈、重建误差变大。
     latent_dim: 128
+
+    # 【各 stage 的通道倍率】长度必须与 strides / transformer_depths 一致（代码里有 assert）。
+    # 256 → 256×1=256 → 256×2=512 → 256×2=512，最后投影到 latent_dim=128。
+    # 想扩容可整体乘 2（例如 [2,4,4]）；想压缩可整体减半。
     c_mults:
     - 1
     - 2
     - 2
+
+    # 【各 stage 的 (时间轴 stride, 动作轴 stride)】动作轴一律不降采样（第二维固定为 1）。
+    # h: 4 →(1) 4 →(2) 2 →(2) 1，所以最终 code_h=1（每个 key 的时间信息被压成 1 个位置）。
+    # 若只想减少 token，可以加大 stride_h；但时间轴压缩越狠，快速动作越难重建。
     strides:
     - - 1
       - 1
@@ -33,33 +222,113 @@ vq_config:
       - 1
     - - 2
       - 1
+
+    # 【每个 stage 里 TransformerBlock 的层数】（顺序与 c_mults/strides 对齐）
+    # 层数越多 → 时间/动作轴上的建模能力越强，参数量与耗时也线性增加。
     transformer_depths:
     - 2
     - 2
     - 2
+
+    # 【注意力头数】与 dim_heads 相乘得到注意力内部维度：8 × 64 = 512。
+    # 该内部维度与各 stage 的通道数各自独立（每个 stage 用自己通道数作为输入维度）。
     num_heads: 8
+
+    # 【每个头的维度】配合 num_heads 使用；RoPE 只施加在每个头的前 max(dim_heads//2, 32)=32 维上。
     dim_heads: 64
+
+    # 【FFN 扩展倍率】本实现用 GEGLU，取 4.0 = 与标准 4× FFN 参数量相当；
+    # 想让这个小模型进一步加容量可以调到 6~8（代码注释里给出的建议区间），代价是参数与显存上升；
+    # ⚠️ 该值属于网络结构，改动后与已有 action_tokenizer 权重不兼容。
     ffn_mult: 4.0
+
+    # 【LayerScale】true = 每个残差分支带一个可学习的逐通道缩放（初始很小），
+    # 让深层 Transformer 训练初期更像“浅网络”，收敛更稳。
     use_layer_scale: true
+
+    # 【LayerScale 初值】0.01 = 训练初期残差分支贡献很小（偏恒等映射），是常见的稳定化取值。
     layer_scale_init: 0.01
+
+    # 【QK-Norm】true = 在计算注意力前对 Q/K 逐头做 LayerNorm，防止 logits 过大导致训练不稳。
     use_qk_norm: true
+
+    # 【RoPE 基频】旋转位置编码的基频；10000 是常规默认值。
+    # 该 tokenizer 序列很短（时间轴被压成 1 个位置），此参数影响有限。
     rope_base: 10000
+
+    # 【分块 DCT 预处理】true = 编码前沿时间轴对每 8 帧做一次 DCT-II（正交归一），
+    # 解码后再做逆 DCT。作用是把“相邻帧高度相关”的信号变成“低频能量集中”的表示，VQ 更容易学。
     use_block_dct: true
+
+    # 【DCT 分块长度】8 = 对每 8 帧做一次 DCT；需要与 horizon 相配合（32 可整除 8）。
     block_dct_block_size: 8
+
+    # 【残差量化层数（RVQ 层数）】4 = 用 4 个码本逐层量化残差，等价于“精度可分级”的表示：
+    # 第 1 层管主体、后续层补细节。因此 token 数 = n_codebooks × code_len = 32/key，
+    # 推理时也可以用更少的层（见文件末尾的 num_residuals：r1pro/libero 等 task 用 2 层换更长 horizon）。
+    # ⚠️ 它同时决定 consistency_* 的层权重列表长度（这里 4），两者必须一致。
     n_codebooks: 4
+
+    # 【每层码本大小】4096 = 每个残差层有 4096 个可用 codeword，
+    # 直接决定注册多少 <actionXXXX> token（0000~4095）与词表大小。
+    # 调大表示更精细、但 token 数/词表变大且码本利用率下降；调小则重建更粗糙。
     codebook_size: 4096
+
+    # 【码本维度（低维投影维度）】码本向量是 8 维，而输入是 latent_dim=128 维：
+    # EMAVectorQuantize 内部先用 in_proj(128→8) 降维再查表，最后 out_proj(8→128) 升回，
+    # 这样能显著降低码本参数量并缓解码本坍缩。
     codebook_dim: 8
+
+    # 【量化器 dropout 概率】训练时有 50% 的样本随机只用 1..n_codebooks 层，
+    # 迫使每一层都独立有用（否则后层可能被前层“喂饱”而学不到东西）。
+    # 也正是它让推理时可以只用前 1~2 层而保持合理精度。
     quantizer_dropout: 0.5
+
+    # 【码本 EMA 衰减系数】码本用指数滑动平均更新（不经过梯度）：0.95 ≈ 约 20 个 batch 的时间常数。
+    # 偏小 → 追随快、可能抖动；偏大 → 更新慢、对新分布适应差。
     ema_decay: 0.95
+
+    # 【死码阈值】某个 codeword 的累计簇计数低于该值就判定为“死码”，用当前 batch 的随机样本替换。
+    # 0.95 衰减下 2 是常用取值；设为 0 可关闭该机制（死码会更难恢复）。
     threshold_ema_dead: 2
+
+    # 【旋转技巧 STE】true = 用“旋转 trick”替代朴素 STE 估计量化项的梯度（对 VQ 训练通常更稳）。
+    # 这里显式取 false，与该权重原本的训练设置保持一致。它只影响**训练**时的梯度估计，
+    # 对推理/解码没有影响；但改成正数后若继续训练 tokenizer，行为会与发布权重的训练方式不同。
     use_rotation_trick: false
+
+    # 【承诺损失权重（commitment loss）】0.25 是 VQ-VAE 的经典默认值：
+    # 促使编码器输出靠近所选 codeword（避免编码器“乱跑”而码本追不上）。
     commitment_loss_weight: 0.25
+
+    # 【重建损失权重】1.0 = 以重建误差为主目标（相对其它辅助损失的权重）。
     reconstruction_loss_weight: 1.0
+
+    # ── 以下 consistency_* 是「token 空间一致性正则」的超参 ──────────────────────
+    # 动机：语义等价的输入（轻微时间平移、幅度缩放）应当产出相同的 token 序列，
+    #       这样 VLM 学起来更稳。实现见 src/g05/tokenizer/models/actioncodec2_v2/consistency.py：
+    #       每步以 p=0.5 只做时间平移、p=0.4 只做幅值缩放、p=0.1 两者都做，得到正样本；
+    #       再比较两者的 per-layer 残差（Hamming 加权）。所有参数在训练前
+    #       [begin_fraction, end_fraction] 区间内线性从 begin 插值到 end，之后保持不变。
+    # 本配置 consistency_loss_weight=0.0 ⇒ 该项完全关闭，因此下面这些 begin/end 取值当前不起作用，
+    # 只是保留一份“文档化的默认调度”，需要时改 weight>0 即生效（不必改别的键）。
+
+    # 【一致性损失权重 λ】0.0 = 关闭；设成正数（例如 0.1）才会启用一致性正则。
     consistency_loss_weight: 0.0
+
+    # 【时间平移强度 起/终值】δ 从 [-delta_max, delta_max] 中取非零整数（单位：帧）。
+    # begin=1（±1 帧）→ end=3（±3 帧）：训练越往后用的扰动越强。
     consistency_delta_max_begin: 1
     consistency_delta_max_end: 3
+
+    # 【幅值缩放强度 起/终值】α ~ U(1-eps, 1+eps)，逐样本采样。
+    # begin=0.02（±2%）→ end=0.1（±10%），同样随时间线性增强。
     consistency_eps_begin: 0.02
     consistency_eps_end: 0.1
+
+    # 【一致性损失在各残差层的权重 起/终值】长度必须等于 n_codebooks(=4)。
+    # begin 全 0 ⇒ 训练早期不做一致性约束（先把重建训好）；
+    # end=[1.0, 0.7, 0.3, 0.1] ⇒ 后期主要约束前几层（低层的 token 更该稳定，高层允许细节差异）。
     consistency_layer_weights_begin:
     - 0.0
     - 0.0
@@ -70,6 +339,52 @@ vq_config:
     - 0.7
     - 0.3
     - 0.1
+
+    # 【调度区间】begin_fraction=0.2 ⇒ 前 20% 训练步保持 begin 值；
+    # end_fraction=0.8 ⇒ 到 80% 训练步时达到 end 值，之后保持 end。
+    # 两者都是“占总训练步数的比例”（0~1）。
     consistency_schedule_begin_fraction: 0.2
     consistency_schedule_end_fraction: 0.8
+
+  # 【动作文本模版】把动作 token 序列格式化成模型看到的字符串。`{action}` 是动作序列的占位符
+  #   （另有一条路经会用到 `{eos}`，见 serialization.py 里的 format 调用；请勿写其它花括号内容，
+  #     否则 format 会因缺少关键字而报错）。
+  #   写成 '{action}' ⇒ 不加任何字面文本，只有动作 token 本身；
+  #   代码默认值是 'Action: {action}|'（会额外学 "Action:" 和 "|" 这两个字面 token）。
+  #   本配置取空模版，是为了让序列最短、且避免这些提示词 token 影响动作段的位置编码与对齐。
   action_template: '{action}'
+
+# =============================================================================
+# 【可选项速查】本文件未写出、但代码支持、task 层经常覆盖的键（默认值来自代码）
+# -----------------------------------------------------------------------------
+# 键                       | 默认值 | 作用与典型用法
+# -------------------------|--------|------------------------------------------------
+# num_residuals            | null   | 启用/使用多少层 RVQ codebook（null = 用满 n_codebooks）。推理用更少层 ⇒
+#                          |        | token 更短、更容易学，是各 task 最常覆盖的一项（r1pro/libero/robotwin 用 2）。
+#                          |        | 它会直接改变 action_token_len，进而改变 BAR 的 block 数。
+# use_group_markers        | false  | true 会在 token 序列里插入 part/group 标记（如 <left_control_0>），
+#                          |        | 使序列可以只生成部分 part，并可解析出“哪些 part 缺失”。改它会改变 token 布局，
+#                          |        | 必须与训练 tokenizer 时一致（各 task 基本都覆盖为 true）。
+#                          |        | 本文件未写该键 ⇒ false ⇒ 走 FlatSerializer（一条扁平序列、没有 part 标记）。
+#                          |        | 它要求 use_extra_tokens=true（否则代码直接抛 NotImplementedError）。
+# group_order_shuffle      | false  | 仅在 use_group_markers=true 时生效：打乱 part 生成顺序，用于增强鲁棒性。
+# dropout_noop_parts       | false  | true = 编码时丢弃“整段无动作”的 part（全 0 或全 padding 的夹爪/未用到的臂），
+#                          |        | 让模型学会“不说话”，可显著缩短序列；解码时缺失 part 会被填成 fill 值。
+# absent_key_fill_value    | null   | 解码时对“缺失的规则类 key（夹爪）”填什么值（null → 0.0；NN 类 key 一律填 0.0）。
+#                          |        | 常见覆盖为 -100.0（配合下游把该 part 当作“不下发”的哨兵值）。
+# ar_block_num             | 0      | BAR 中前多少个 block 直接作为已知输入给出（同时也参与监督），
+#                          |        | 用于块级 teacher forcing 起步；推理时一般不使用。
+# fast_skip_tokens         | 128    | 仅在 use_extra_tokens=false 时生效：从词表末尾往前留出的跳过量，避免与已有 token 冲突。
+# relaxed_decoding         | false  | 历史遗留字段：当前代码只读取并保存，解码路径并未使用。
+# n_bins / min_action / max_action | 256 / -1 / 1 | 旧式 proprio 编码器的分箱参数，只在
+#                          |        | model.model_arch.proprio_encoder: bin 时真正生效（当前配置用 mlp，故不生效）。
+#
+# 【改动风险速查】
+#   * 改 parts_meta / codebook_size / n_codebooks / max_component_dim / horizon / use_group_markers
+#     ⇒ 动作 token 的数量或含义变了，旧的动作 tokenizer 权重与旧 VLA checkpoint 都不再兼容，
+#       必须重新训练 tokenizer（train_vq.py 一类脚本）并重训/转换 VLA 权重。
+#   * 改 ckpt_dir ⇒ 只是换权重文件，但要求网络结构（model_arch）与该权重完全一致。
+#   * 改 block_size / block_wise_autoregressive / num_residuals / dropout_noop_parts
+#     ⇒ 属于“用法”而非网络结构，可与已有 tokenizer 权重共存，但会改变序列长度与训练/推理行为，
+#       需保证训练与推理（含部署配置）使用同一套取值，否则会静默对齐错位。
+# =============================================================================

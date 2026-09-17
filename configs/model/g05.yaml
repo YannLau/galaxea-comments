@@ -1,91 +1,390 @@
-# Final G0.5 Qwen3.5-2B VLA model config.
+# =============================================================================
+# configs/model/g05.yaml — G0.5 主模型配置（Qwen3.5-2B VLA）
+# =============================================================================
+#
+# 【这个文件是什么】
+# 这是仓库里 “模型结构 + 训练超参” 的主配置文件，挂在 Hydra 的 model 配置组下。
+# 训练 / 离线评测 / 部署三条链路最终都会用到它：
+#   * 训练     : scripts/finetune.py
+#   * 离线评测 : scripts/eval_open_loop.py
+#   * 策略服务 : scripts/serve_policy.py / scripts/serve_policy_mem.py
+# 每个任务通过自己的 configs/task/<task>.yaml 用 `override /model: g05` 选中本文件
+# （见 configs/task/r1pro.yaml 的 defaults），再用 `model.<key>=<value>` 覆盖其中任意字段：
+#   bash scripts/run/finetune.sh 8 r1pro model.learning_rate=4e-05
+# 命令行 override 的优先级最高。想改“本任务”的超参，请优先写在 configs/task/<task>.yaml
+# 的 `model:` 下；只放“所有任务共享的默认值”时才改本文件。
+# 另一个变体 configs/model/g05_mem.yaml 通过 defaults 继承本文件，只覆盖差异项。
+#
+# 【怎么读这个文件】
+# 文件分为两大部分：
+#   1) 顶层键（pretrained_ckpt / batch_size / learning_rate / ...）
+#      属于“训练循环超参”，代码里写作 cfg.model.xxx，由 scripts/finetune.py 读取。
+#   2) model_arch 子树
+#      才是真正的模型定义，由 finetune.py 用 hydra.utils.instantiate() 实例化，
+#      即构造 g05.models.g05.g05_policy_qwen35.G05PolicyQwen35 这个类；
+#      该类内部再装配 G05ModelQwen35（Vision + VLM + Action Expert）。
+#
+# 【整体架构（一句话）】
+#   Qwen3.5-2B 的 LLM 被拆成两个“结构相同、配置不同”的 Mixture 实例：
+#     vlm           : 视觉语言主干（看图 + 读指令，输出理解结果）
+#     action_expert : 动作专家（输出连续动作速度 / 离散动作 token）
+#   两者靠 KV cache 与线性注意力循环状态耦合，ViT 视觉塔单独挂在 G05Model 层。
+#   详细层次关系见 docs/architecture/g05_architecture_zh.md、
+#   docs/architecture/qwen35_design_zh.md、docs/architecture/g05_config_zh.md。
+#
+# 【${...} 语法】
+# 都是 OmegaConf 插值：引用同一配置树里的其他键，或调用已注册的 resolver
+# （实现见 src/g05/utils/config/config_resolvers.py）：
+#   ${data.action_size}        引用数据配置里的动作序列长度（= 动作 chunk 长度 H）
+#   ${obs_image_steps:...}     自定义 resolver，把 obs_size 原样取成整数
+#   ${eval:'...'}              在字符串里做四则运算（任意 Python 表达式，谨慎使用）
+#   ${oc.load:path,key}        从另一个 YAML 文件里取某个子树
+# 好处：换数据集（改 configs/data/<task>.yaml）时这些形状自动跟着变，无需手改模型配置。
+
+# -----------------------------------------------------------------------------
+# 1. 权重来源与数值精度
+# -----------------------------------------------------------------------------
+
+# 【训练起始权重】指向“基座 VLA checkpoint”（含 VLM + Vision + Action Expert 全套权重），
+# 不是 HF 原始 LLM。加载路径：finetune.py → load_model_from_checkpoint()，
+# 它先 instantiate(model_arch) 建好结构，再把 checkpoint 里的 model_state_dict 灌进去
+# （所以下面 pretrained_model_path 为 null，不需要再读 HF safetensors）。
+# 与顶层 resume_ckpt 的区别（详见 configs/train.yaml 同名注释）：
+#   pretrained_ckpt : 只取权重，优化器/step 从 0 开始   → “微调”
+#   resume_ckpt     : 额外恢复优化器/调度器/step 状态   → “接着上次跑”
+# ⚠️ 路径要写成 <run_dir>/checkpoints/model_state_dict.pt 这种形式：
+# 代码用 Path(ckpt).parent.parent/dataset_stats.json 去找数据归一化统计量。
 pretrained_ckpt: checkpoints/g05-base/checkpoints/model_state_dict.pt
+
+# 【是否复用基座 checkpoint 的数据归一化统计量】
+# false → 现场从训练集重新统计 action/state 的 min/max/分位数等（换数据集时用这个）；
+# true  → 直接读 <run_dir>/dataset_stats.json（= Path(pretrained_ckpt).parent.parent 下的那份，
+#         即 checkpoint 所在的 run 目录），数据分布与基座一致时可省掉一轮全量统计。
+# 代码位置：scripts/finetune.py 的 norm stats 分支（search "norm_stats_source"）。
 use_pretrained_norm_stats: false
+
+# 【是否把模型权重整体转成 bfloat16】训练一般保持 false：
+# 权重留在 fp32、前向靠 autocast(bf16) 混合精度（见下一项），优化器更新更稳。
+# 设为 true 更省显存/更快，但数值风险更高。
+# 注意部署脚本把缺省值当作 true —— serve_policy.py: cfg.model.get("model_weights_to_bf16", True)，
+# 也就是推理默认走 bf16 权重；需要 fp32 推理时显式传 model.model_weights_to_bf16=false。
 model_weights_to_bf16: false
+
+# 【是否开启 bf16 混合精度训练】决定 accelerate 的 mixed_precision 与 autocast dtype：
+# true  → 前向/反向在 bf16 autocast 下执行，显存占用明显更低，是本仓库推荐的训练模式；
+# false → 全部 fp32，更精确但更慢更占显存。
+# 少数对数值敏感的参数会始终强制 fp32（QK norm、GatedDeltaNet 的 A_log/dt_bias、
+# Action Expert 的输入输出投影与时间编码、proprio 编码器等），
+# 由 G05PolicyQwen35.fp32_param_patterns + model.apply_fp32_params() 保证，无需手动处理。
 enable_bf16_training: true
+
+# 【是否用 torch.compile 编译模型】首次编译较慢，之后每个 step 更快。
+# 训练默认 false（收益不稳定且可能反复重编译）；部署 README 里有开启的示例。
 use_torch_compile: false
+
+# 【DDP 的 find_unused_parameters】
+# true 时 DDP 每步扫描计算图，允许存在“没参与 loss 的参数”（例如只走 FM 不走 AR 分支），
+# 代价是每个 step 变慢。本配置 AR 与 FM 两条路径都参与 loss，所以设 false 换速度。
+# 例外：只训练 FM 的任务（如 configs/task/libero.yaml，ar.ce_weight=0.0）会设成 true。
 find_unused_parameters: false
+
+# -----------------------------------------------------------------------------
+# 2. DataLoader（单卡批大小与取数进程）
+# -----------------------------------------------------------------------------
+
+# 单卡 batch size（micro-batch）。全局 batch = batch_size × GPU 数 × grad_accumulation_steps。
+# 显存不够时优先降这个，其次再考虑打开 checkpoint_vision。
 batch_size: 16
+
+# 每个 DataLoader 的取数进程数（0 表示主进程取数）。越大 CPU 侧预处理越跟得上，
+# 但更吃内存与文件句柄（LeRobot 数据集体积大，调太高可能 OOM）。
 num_workers: 8
+
+# 是否把 batch 锁页（page-locked）内存，使 H2D 拷贝更快。数据搬到 GPU 时通常开 true。
 pin_memory: true
+
+# worker 是否跨 epoch 常驻：true 时只启动一次，避免每个 epoch 重新加载数据集
+# （LeRobot 数据集加载开销大），num_workers > 0 时推荐开启。
 persistent_workers: true
+
+# -----------------------------------------------------------------------------
+# 3. 训练长度、优化器与学习率调度
+# -----------------------------------------------------------------------------
+
+# 训练轮数。与 max_steps 互斥（同时设置两者会 assert 失败，见 finetune.py）：
+#   max_steps = ceil(len(train_dataloader) / grad_accumulation_steps * max_epochs)
+# 两种写法在各 task 配置里都能见到（libero 用 max_steps，r1pro 用 max_epochs），
+# 选定其中一种即可；本文件只是提供一个默认值，通常会被 task 配置覆盖。
 max_epochs: 2
+
+# 训练步数上限（优化器更新次数，不是 forward 次数）。null = 由 max_epochs 推导。
 max_steps: null
+
+# 梯度累积：每累积多少次 micro-batch 才做一次优化器更新。
+# 用于在显存有限时凑出更大的等效 batch（等效 batch = batch_size × GPU 数 × 本值）。
 grad_accumulation_steps: 1
+
+# 【8bit 优化器】true 时使用 bitsandbytes 的 AdamW8bit，优化器状态显存约降 4 倍；
+# 与 configs/train.yaml 的 use_fused_optimizer 互斥（同时开会在代码里直接报错）。
+# 单卡显存紧张时才有意义；多卡常规训练保持 false。
 use_8bit_optimizer: false
+
+# 基础学习率。模型按参数组缩放（G05Policy.get_optim_param_groups）：
+#   action_expert 组 = lr
+#   VLM/主干组      = lr × backbone_lr_multiplier
+#   视觉塔组        = lr × backbone_lr_multiplier × vision_lr_multiplier
+# 也就是说这里的 lr 是“动作专家”的学习率，主干按倍率打折。
 learning_rate: 8.0e-05
+
+# AdamW 的权重衰减。注意 norm/bias 类参数是否加 decay 由
+# apply_decay_on_norm_and_bias 控制（本文件未写，默认不加）。
 weight_decay: 0.01
+
+# AdamW 的 beta1 / beta2。机器人动作训练常用 (0.9, 0.95)，比默认的 0.999 收敛更跟得上。
 betas:
 - 0.9
 - 0.95
+
+# 学习率调度器类型。warmup_constant_cosine 是本仓库自定义的“三段式”：
+#   [0, warmup_steps)                       线性预热 0 → lr
+#   [warmup_steps, constant_end_ratio×总步数) 保持恒定 lr
+#   [constant_end_ratio×总步数, 结束]        余弦衰减到 lr × lr_min_ratio
+# 实现见 src/g05/utils/training/get_scheduler.py。
 lr_scheduler_type: warmup_constant_cosine
+
+# 余弦末端的最低学习率比例（0.1 = 衰减到初始 lr 的 10%，而不是 0）。
+# 保住一点学习率通常比衰减到 0 更稳。
 lr_min_ratio: 0.1
+
+# 线性预热步数。若配置里写了 warmup_ratio（本文件末尾有），则优先用
+# warmup_steps = int(max_steps × warmup_ratio)，覆盖本值。
 warmup_steps: 500
+
+# 梯度裁剪的 L2 范数上限，防止偶发的大梯度破坏权重。
 max_grad_norm: 1.0
+
+# 【指数滑动平均（EMA）】true 时额外维护一份 EMA 权重并用于评测/保存（更平滑）。
 use_ema: false
 ema:
+  # 从第几个 step 之后才开始 EMA 更新（0 = 立即开始）。
+  # 训练初期权重抖动大，设一个较大的值可避免 EMA 被早期噪声污染。
   update_after_step: 0
+  # EMA 的衰减强度（来自 ema-pytorch 的 beta）：越大越平滑、滞后越多。
   power: 0.67
+
+# 是否把 BatchNorm 换成 SyncBatchNorm（多卡同步统计量）。本模型基本不用 BN，
+# 保持 false 即可。
 use_sync_bn: false
+
+# 【collate 函数开关】注意这里是“开关”而不是函数名：只要该值非空（字符串 "identity" 也算真），
+# finetune.py 就会启用 g05.utils.data.data_utils.collate_fn_pad_sequences，
+# 把 batch 内样本 pad 到等长（用 pad_token_id 填充）。设为 null/空值则直接使用默认 collate。
 collate_fn: identity
+
+# -----------------------------------------------------------------------------
+# 4. model_arch：模型实例化入口与全局形状
+# -----------------------------------------------------------------------------
+# 下面这棵子树会被 hydra.utils.instantiate() 整棵传给 G05PolicyQwen35(**model_arch)。
+# 因此这里的每个键名都必须能在代码里找到对应读取点（新加字段前先确认谁在读）。
 model_arch:
+
+# 要实例化的模型类。换骨干（例如 PaliGemma 版 G05Policy）时只改这一行 + 对应的
+# vlm/vision 子树即可，上层训练脚本不变。
   _target_: g05.models.g05.g05_policy_qwen35.G05PolicyQwen35
+
+# HF 预训练权重目录（Qwen3.5-2B 的 config/safetensors）。null = 不加载 HF 原始权重，
+# 所有参数都由顶层 pretrained_ckpt 提供。首次从 HF 起训时才需要填路径。
   pretrained_model_path: null
+
+# 只用来加载 tokenizer/processor（Qwen35ProcessorWrapper 会读这里的 tokenizer.json）。
+# 为什么与 pretrained_model_path 分开：eval/serve 时 ckpt_utils 会把 pretrained_model_path
+# 置 null（避免下载 HF 权重），但会保留这份原始路径，让 tokenizer 仍能正常构造。
   hf_processor_path: checkpoints/qwen3_5_2b_base_processor
+
+# tokenizer/processor 的包装类。Qwen3.5 用自研轻量实现（不依赖 transformers 的
+# AutoProcessor），负责特殊 token 注册与 <|vision_start|>/<|image_pad|> 布局。
   hf_processor_class: g05.models.g05.qwen35.processing.Qwen35ProcessorWrapper
+
+# 【词表边界，Qwen3.5-2B 固定值，不要随意改动】
+#   [0, 248044)                 Qwen BPE 原始词表
+#   [248044, 248077)            Qwen 自带 added special tokens（EOS/EOC/EOV/<|image_pad|> 等 33 个）
+#   [248077, ...)               动作 tokenizer 追加的 action token（运行时由 InputPreprocessor 注册）
+# base_vocab_size  = 追加任何新 token 之前的词表大小，用于 resize 时“只复制老 token 的权重”；
+# padded_vocab_size = 对齐到 128 倍数后的词表大小（248320），用于建 embedding 时留余量。
   base_vocab_size: 248044
   padded_vocab_size: 248320
+
+# 是否额外注册 1024 个 <loc0000>~<loc1023> 坐标 token（用于 CoT 里输出 bbox 坐标）。
+# 打开后 action token 的起始 ID 会整体后移 1024，与已有 checkpoint 不兼容，
+# 因此默认关闭；需要 CoT 坐标预测的任务才开，且必须重新训练/转换权重。
   add_loc_tokens: false
+
+# <|image_pad|> 的 token id。文本模板里每个“图像占位符”最后会展开成若干个该 token，
+# 其隐藏状态由 ViT 特征替换（见 MaskHelper 与 _forward_embed）。
   image_token_index: 248056
+
+# padding token id（Qwen3.5 用 0）。同时作为 Embedding 的 padding_idx。
   pad_token_id: 0
+
+# VLM 侧实际使用的词表大小。这里等于 padded_vocab_size；
+# 运行时 InputPreprocessor 会按注册后的真实词表长度再 resize 一次 embedding。
   vocab_size: 248320
+
+# 句子结束 token（<|endoftext|>）。AR 推理时它始终被加入停止集合，
+# 也是 generate_text 生成 CoT 文本时的默认终止符。
   eos_token_id: 248044
+
+# 【动作/本体维度】必须与 tokenizer 的 parts_meta 分组维度一致：
+# configs/tokenizer/actioncodec.yaml → parts_meta 为
+#   left_control 9 + left_gripper 1 + right_control 9 + right_gripper 1 = 20
+# 换机器人（例如 r1pro 带 lower_body 的 27 维）时，task 配置会覆盖这两个值。
   action_dim: 20
   proprio_dim: 20
+
+# 本体感知（proprio/state）的编码方式：
+#   "mlp" → 用可学习 MLP 把 proprio 投影到 VLM 隐藏维度后插入序列（本配置）
+#   "bin"  → 离散化成 bin token（老方案）
+#   "zeros"/"null" → 不输入 proprio
   proprio_encoder: mlp
+
+# 动作 chunk 长度 H（一次预测多少步动作）。这里从数据配置引用：configs/data/<task>.yaml
+# 的 action_size（r1pro 为 32），因此换数据集时自动跟随。
   horizon_steps: ${data.action_size}
+
+# 观测步数 T（一次喂几帧历史观测）。${obs_image_steps:...} 是自定义 resolver，
+# 把 data.obs_size 原样取出；单帧任务 obs_size=1，MEM 多帧任务为 6。
+# 注意它与数据侧的 obs_stride_second 配合使用（见 docs/architecture/qwen_mem_overview_zh.md）。
   cond_steps: ${obs_image_steps:${data.obs_size}}
+
+# 与 cond_steps 保持一致（VLM 一次看到 T 帧）。被 G05PolicyQwen35 用于 FLOPs 估算与日志，
+# 这里写成插值就是为了避免两处手改不同步。
   num_obs_steps: ${model.model_arch.cond_steps}
+
+# 注意力实现。训练用 eager（显存换稳定、便于自定义 mask/位置编码）；
+# 部署可改 flash_attention_2 提速（需安装 flash-attn）。
   attn_implementation: eager
+
+# 位置编码方案。可选：pi0fast（本配置）/ lyc / lycv2 / gaussian。
+# pi0fast 是 π0-FAST 风格：图像/文本/动作各自占一段连续位置，动作段从固定偏移开始，
+# 详见 src/g05/models/g05/helpers/mask_helper.py。
   position_ids_type: pi0fast
+
+# 动作段位置编码的偏移量。null = 由 MaskHelper 动态计算
+# （取 prefix 段 position_ids 的最大值 + 1），一般不要硬编码。
   action_position_offset: null
+
+# 【梯度检查点（用计算换显存）】三处可独立开关：
+#   checkpoint_vision        : ViT 逐层重算，省显存最多（ViT 24 层 × 多相机 token 很吃显存）
+#   checkpoint_vlm           : VLM 24 层
+#   checkpoint_action_expert : 动作专家 24 层
+# 打开后反向传播会重算前向，训练变慢但显存显著下降。默认只开视觉塔。
+# （注意旧的 checkpoint_joint / checkpoint_action_decoder 键已废弃，代码不再读取。）
   checkpoint_vision: true
   checkpoint_vlm: false
   checkpoint_action_expert: false
+
+# -----------------------------------------------------------------------------
+# 5. vlm：视觉语言主干（Qwen3.5-2B 的 LLM 部分）
+# -----------------------------------------------------------------------------
+# 它是 MixtureQwen35 的一个实例：输入是 token 序列（图像 token 的 embedding 已被 ViT
+# 特征替换），输出是每个位置的 logits。负责“看懂图 + 读懂指令 + 生成 CoT/动作 token”。
+# 所有字段来自 Qwen3.5-2B 官方 config，改动即改变网络结构，需与权重匹配。
+
+# 实现类。换骨干模型时改这里。
   vlm:
     name: g05.models.g05.qwen35.mixture_qwen35.MixtureQwen35
+
+    # 隐向量维度 d_model。Qwen3.5-2B 为 2048，ViT 特征最终也投影到该维度才能拼接。
     hidden_size: 2048
+
+    # FFN（SwiGLU）中间维度：down(silu(gate(x)) * up(x))，通道数为 6144。
     intermediate_size: 6144
+
+    # Transformer 层数（24）。每层是 full_attention 还是 GatedDeltaNet 见 layer_types。
     num_hidden_layers: 24
+
+    # Query 头数。Qwen3.5 采用 GQA：8 个 Q 头共享 2 组 K/V，用于省显存。
     num_attention_heads: 8
+
+    # Key/Value 头数（GQA 分组数）。必须是 num_attention_heads 的约数。
     num_key_value_heads: 2
+
+    # 每个头的维度。注意 num_attention_heads × head_dim = 8×256 = 2048 = hidden_size。
+    # ⚠️ 这个值与 Action Expert 必须一致：动作专家要复用 VLM 的 KV cache，
+    #    K/V 的最后一维（num_kv_heads × head_dim = 512）必须对得上。
     head_dim: 256
+
+    # RMSNorm 的 eps，防止除零。
     rms_norm_eps: 1.0e-06
+
+    # 最大位置数（256K 上下文）。本任务序列远小于它，保持默认即可。
     max_position_embeddings: 262144
+
+    # 线性层是否带 bias。Qwen3.5 全模型为 false（无 bias）。
     attention_bias: false
+
+    # 输入投影类型：
+    #   "embedding" → nn.Embedding(vocab→hidden)，即 VLM 的输入
+    #   "linear"    → 线性投影，即 Action Expert 的输入（见 action_expert 段）
     input_type: embedding
+
+    # 词表大小 / pad id，直接引用全局值，避免两处不一致。
     vocab_size: ${model.model_arch.vocab_size}
     pad_token_id: ${model.model_arch.pad_token_id}
+
+    # 输出投影类型："lm_head" → Linear(hidden→vocab)，权重与 embedding 绑定（tied）。
     output_type: lm_head
+
+    # 自适应归一化模式：null = 标准 RMSNorm；"adaLN" = 带时间条件的 AdaLN（动作专家用）。
+    # VLM 没有时间条件，所以是 null。
     adaptive_mode: null
+
+    # 时间条件维度。0 = 不创建 time_embedding/time_mlp（只有动作专家需要）。
     time_hidden_size: 0
+
+    # 输出前是否加一层 final norm（LLM 标准做法）。
     use_final_norm: true
+
+    # MLP 激活函数。silu 对应 SwiGLU。
     hidden_act: silu
+
+    # ── RoPE / MRoPE 位置编码参数 ──
     rope_parameters:
+      # 旋转位置编码的底数。1e7 适合长上下文（Qwen3 系列使用）。
       rope_theta: 10000000.0
+      # default = 普通 RoPE；Qwen3.5 在此基础上做 MRoPE 多维扩展。
       rope_type: default
+      # M(ultimodal) RoPE：把旋转维度按 时间/高/宽 切成 3 段（11+11+10 = 32 个频率对），
+      # 让图像 patch、文本、动作三类位置各自有合理的空间/时间位置编码。
       mrope_section:
       - 11
       - 11
       - 10
+      # true = 三个维度的频率交错排列（interleaved），与 Qwen3.5 官方实现对齐。
       mrope_interleaved: true
+      # 只对 head_dim 的一部分施加旋转（0.25 → 256×0.25 = 64 维参与 RoPE），
+      # 既保留长程位置信息又降低对通道的扰动。
       partial_rotary_factor: 0.25
+
+    # ── GatedDeltaNet 线性注意力（layer_types 里 linear_attention 层的参数）──
+    # 它把注意力的 O(S²) 降到近似线性，用于绝大部分层；每 4 层保留 1 层 full attention。
+
+    # 线性注意力内核实现："fla"（fla 库，默认）/ "flashqla" / "torch"（纯 PyTorch，最慢但无依赖）。
     linear_attn_backend: fla
+    # 因果深度可分离卷积的核宽（决定局部上下文窗口）。
     linear_conv_kernel_dim: 4
+    # 线性注意力中 Q/K 每头维度（16 头 × 128 = 2048 = hidden_size）。
     linear_key_head_dim: 128
+    # 线性注意力中 V 每头维度（16 头 × 128 = 2048）。
     linear_value_head_dim: 128
+    # Q/K 头数与 V 头数（线性注意力不要求与 full attention 的 GQA 头数一致）。
     linear_num_key_heads: 16
     linear_num_value_heads: 16
+
+    # 【层类型排布】24 层 = 6 × (3×linear_attention + 1×full_attention)，
+    # 即每 4 层中前 3 层是 GatedDeltaNet 线性注意力、第 4 层是标准全局注意力。
+    # 这样既有线性注意力的低显存/长序列优势，又保证周期性全局信息交换；
+    # full attention 层也是 KV cache 的“锚点”（动作专家主要复用这些层的 K/V）。
     layer_types:
     - linear_attention
     - linear_attention
@@ -111,26 +410,72 @@ model_arch:
     - linear_attention
     - linear_attention
     - full_attention
+
+# -----------------------------------------------------------------------------
+# 6. action_expert：动作专家（负责生成动作的那半个 LLM）
+# -----------------------------------------------------------------------------
+# 与 vlm 是同一个类，但角色完全不同：
+#   * 输入不是 token id，而是加噪动作 psi_t ∈ [B, H, action_dim]（H = horizon_steps）
+#   * 输出不是词表 logits，而是每一步的动作速度 v ∈ [B, H, action_dim]（连续动作）
+#     或离散动作 token（走 AR 头，见 ar 段）
+#   * 每层带 AdaLN 时间条件（把扩散/流匹配的时间步 t 注入归一化层）
+# 它通过 KV cache 关注 VLM 的 prefix（也就是“看图和读指令”的上下文），
+# 具体怎么注入由文件末尾的 ae_vlm_condition_mode 决定。
   action_expert:
     name: g05.models.g05.qwen35.mixture_qwen35.MixtureQwen35
+
+    # 隐维度 1024，比 VLM 的 2048 小一半（动作序列短、任务更窄，不需要那么宽）。
+    # 输入输出都是线性投影，因此内部维度可以独立于 VLM。
     hidden_size: 1024
+
+    # FFN 中间维度。
     intermediate_size: 4096
+
+    # 层数与 VLM 相同（24）。层类型见下方 layer_types。
     num_hidden_layers: 24
+
+    # 注意力头数 / GQA 组数。
     num_attention_heads: 8
     num_key_value_heads: 2
+
+    # ⚠️ 必须与 VLM 的 head_dim 一致：动作专家的 full attention 层把 VLM 的 K/V 当作
+    # past_key_values 拼在自己的 K/V 前面，因此 K/V 的最后一维必须相同：
+    #   num_key_value_heads × head_dim = 2 × 256 = 512，与 VLM 段一致。
+    # （attention_dim = num_attention_heads × head_dim = 2048 大于本模块 hidden_size 1024，
+    #   这没问题：q_proj 负责升维、o_proj 负责降回 hidden_size。）
     head_dim: 256
+
+    # 以下若干字段与 VLM 相同含义：
+    #   rms_norm_eps / max_position_embeddings / attention_bias / use_final_norm / hidden_act
+    # 与 VLM 保持一致是为了共享位置编码与归一化实现。
     rms_norm_eps: 1.0e-06
     max_position_embeddings: 262144
     attention_bias: false
+
+    # adaLN = 归一化层的 scale/shift 由时间步 t 调制（流匹配的关键：模型要知道自己
+    # 正在去噪到哪个时刻）。VLM 没有时间概念，所以那边是 null。
     adaptive_mode: adaLN
+
+    # 时间条件维度（正弦位置编码 → MLP 的输出维度）。1024 = 本模块 hidden_size。
+    # 注入路径（AdaRMSNorm）：
+    #   t [B] → time_embedding(正弦) → time_mlp_in → silu → time_mlp_out → silu → [B, hidden]
+    # 这条向量再生成每层归一化的 scale/shift，让模型知道当前去噪到哪个时间步。
     time_hidden_size: 1024
+
+    # 输入/输出投影类型：
+    #   input_type:  linear，把 action_dim 维动作向量升到 hidden_size
+    #   output_type: linear，把 hidden_size 降回 action_dim（权重零初始化，
+    #                使得训练第 0 步模型输出 0 速度，初期梯度更干净）
     input_type: linear
     input_dim: ${model.model_arch.action_dim}
     output_type: linear
     output_dim: ${model.model_arch.action_dim}
     use_final_norm: true
     hidden_act: silu
+
+    # ── RoPE / MRoPE 参数 ──
     rope_parameters:
+      # 与 VLM 完全一致（同一套 RoPE/MRoPE 参数），保证动作 token 的位置语义可对齐。
       rope_theta: 10000000.0
       rope_type: default
       mrope_section:
@@ -139,12 +484,24 @@ model_arch:
       - 10
       mrope_interleaved: true
       partial_rotary_factor: 0.25
+
+    # ── GDN 线性注意力参数 ──
+    # 本配置里 layer_types 全是 full_attention，因此 GatedDeltaNet 层不会被构造，
+    # 下面这几个键实际不会被读取；保留它们是为了与 VLM 段字段对齐、便于切换结构。
+    # 变体 configs/model/g05_mem.yaml 把 layer_types 改成混合类型后，它们才会真正生效。
     linear_attn_backend: fla
     linear_conv_kernel_dim: 4
     linear_key_head_dim: 128
     linear_value_head_dim: 128
     linear_num_key_heads: 16
     linear_num_value_heads: 16
+
+    # 【层类型】本配置下 24 层全部是 full_attention（与 VLM 的 3:1 混合不同）。
+    # 原因：动作专家需要每一层都能“跨注意力”读取 VLM 的 prefix KV；
+    # 若某层是 GatedDeltaNet，它只能通过循环状态接收 VLM 信息（不是显式 K/V attention），
+    # 那就必须换用 g05_mem 那种配置。两种做法都受支持，但必须与训练权重一致：
+    # 用全 full 的结构去加载混合注意力的 checkpoint，会出现大量 self_attn/linear_attn
+    # 参数对不上（missing / unexpected），反之亦然。
     layer_types:
     - full_attention
     - full_attention
@@ -170,100 +527,345 @@ model_arch:
     - full_attention
     - full_attention
     - full_attention
+
+# -----------------------------------------------------------------------------
+# 7. fm：Flow Matching（连续动作生成）
+# -----------------------------------------------------------------------------
+# 训练时不做扩散的“多步去噪”，而是直接回归速度场：把真值动作 x1 和噪声 x0 按时间 t
+# 插值成 psi_t，让动作专家预测 d(psi_t)/dt；推理时用欧拉积分从噪声一步步推回动作。
+# 实现见 src/g05/models/g05/helpers/fm_helper.py（FMHelper 不持有任何参数）。
+# 若某任务只训练离散动作，可把 fm_weight 设为 0（或 continuous_action: false）。
   fm:
+    # 时间约定（决定 psi_t 插值方向与回归目标符号）：
+    #   pi_convention      : psi_t = (1-t)·x1 + t·x0，t=0 是干净动作、t=1 是纯噪声（π0 风格）
+    #   galaxea_convention : psi_t = t·x1 + (1-t)·x0，方向相反
+    # 必须与训练权重一致，改错不会报错但模型学不到东西。
     time_convention: pi_convention
+
+    # 训练时间步 t 的采样分布。beta（Beta(1.5,1)）偏向 t 较小的区域，
+    # 即更多在“接近干净动作”处训练，动作精度更好；uniform 为均匀采样。
     flow_sampling: beta
+
+    # 噪声下限，t 的采样范围被限制在 [flow_sig_min, 1-flow_sig_min]，避免极端时刻数值不稳。
     flow_sig_min: 0.001
+
+    # 推理时欧拉积分的步数：步数越多越精细、越慢（10 步是本模型的默认工作点）。
     num_inference_steps: 10
+
+    # 【多噪声采样】1 = 每个样本采一组 (t, 噪声)。
+    # >1 时会额外采样 N 组并把 batch 扩成 N×B，等价于降低 FM 损失的方差（更贵但更稳），
+    # 例：configs/task/r1pro.yaml 用 4，libero 用 8。
     num_flow_samples: 1
+
+    # FM 损失在总损失中的权重（总损失 = fm_weight × fm_loss + ce_weight × ce_loss）。
     fm_weight: 1.0
+
+    # 是否让梯度从动作专家回流到 VLM 的 KV（true 会一起微调主干，显存/时间更高）。
+    # false = VLM 在 FM 分支上被当作固定的“条件提供者”。
     joint_training: false
+
+    # 被 padding 的动作步（action_pad_masks）在损失里的权重。0.0 = 完全忽略填充步，
+    # 避免不同长度 episode 的填充噪声影响训练。
     padding_action_weight: 0.0
+
+    # 与 padding_action_weight 配合的模式开关（A/B）：
+    # false → 对被 padding 的动作维度也降权为 padding_action_weight；
+    # true  → 认为填充维度的目标是 0，用正常权重学习“输出 0”。
     zero_pad_action_target: false
+
+    # 推理输出的截断值（例如 1.0 把动作裁到 [-1,1]）。null = 不裁剪。
     final_action_clip_value: null
+
+    # 动作 token 之间是否做因果注意力。false = 动作序列内部互相全可见（默认，Chunk 内一次生成）。
     action_causal: false
+
+    # 形状引用，避免与 model_arch 顶层手改不同步。
     horizon_steps: ${model.model_arch.horizon_steps}
     action_dim: ${model.model_arch.action_dim}
+
+# -----------------------------------------------------------------------------
+# 8. ar：自回归头（离散动作 token + CoT 文本）
+# -----------------------------------------------------------------------------
+# VLM 本身就是语言模型，这一节配置它“按 token 生成”的那条路径：
+#   * 训练：对 action token（以及可选的 CoT 文本 token）算交叉熵损失 ce_loss
+#   * 推理：逐 token 采样出离散动作，再由动作 tokenizer 解码回连续动作
+# 实现见 src/g05/models/g05/helpers/ar_helper.py。
+# 注意：下面几项（block_wise_autoregressive / bos_blk_id / eos_blk_id / block_size）
+# 在 G05Policy 初始化时会被动作 tokenizer 的真实配置覆盖，这里写的是兜底默认值。
   ar:
+    # CE 损失权重。只想训练连续动作（FM）时把它设成 0，例如 configs/task/libero.yaml。
     ce_weight: 1.0
+
+    # 词表大小（引用全局值，用于 fused CE 的维度对齐）。
     vocab_size: ${model.model_arch.vocab_size}
+
+    # 【token id 分段边界】用于把 token 划分到不同的“桶”，从而决定位置编码与准确率统计：
+    #   [0, text_token_end)              → 普通文本 token（含指令、图像 token）
+    #   [text_token_end, loc_token_end)  → CoT / 特殊 token（EOC、EOV、<|image_pad|> 等）
+    #   [action token 区间)              → 动作 token（起点由动作 tokenizer 运行时决定）
+    # 这几个数字与 Qwen3.5-2B 的词表布局绑定，换 tokenizer 时必须同步修改。
     text_token_end: 248044
     loc_token_end: 248077
+
+    # 是否使用 liger_kernel 的 fused 线性 CE：不落地 [N_valid, vocab] 的完整 logits，
+    # 峰值显存可从约 20GB 降到约 2GB，长序列训练基本必开。
+    # 只是日志步需要完整 logits 算 ECE 等指标，代码会在那些 step 自动切回慢路径。
     use_fused_ce: true
+
+    # z-loss 系数（约束 logits 的尺度，Gemma 论文推荐 1e-4）。0.0 = 关闭。
+    # 该值必须显式写出（不使用 .get 兜底），以免“悄悄”改变训练目标。
     ce_z_loss_scale: 0.0
+
+    # 是否使用分块自回归（BAR）：一次并行预测一个 block 的多个动作 token，
+    # 再逐块推进，比逐 token 生成快得多。真实值会被动作 tokenizer 覆盖。
     block_wise_autoregressive: true
+    # BAR 的块边界 token（null = 用动作 tokenizer 提供的值）。
     bos_blk_id: null
     eos_blk_id: null
+    # BAR 每块的 token 数（null = 用动作 tokenizer 提供的值）。
     block_size: null
+
+    # 【推理采样参数】do_sample=false 时走贪心（确定性，评测/部署推荐）；
+    # true 时按 temperature/top_k/top_p 采样，并用 repetition_penalty、
+    # no_repeat_ngram_size 抑制重复。这些值都可以在推理调用时被 kwargs 覆盖。
     do_sample: false
+    # AR 一次最多生成多少个 token（同时也是 CoT 生成长度的上限保护）。
     max_new_tokens: 300
     temperature: 0.7
     top_k: 128
     top_p: 0.95
     repetition_penalty: 1.2
     no_repeat_ngram_size: 3
+
+# -----------------------------------------------------------------------------
+# 9. vision：ViT 视觉编码器（Qwen3.5 原生结构）
+# -----------------------------------------------------------------------------
+# 工作流程：多相机图像 → Conv3D patch embedding → 24 层 ViT（2D RoPE）→ PatchMerger
+# （把 2×2 个 patch 合并成 1 个 token，并把通道投影到 VLM 的 2048 维）→ 塞进 token 序列。
+# 输出 token 数示例（本配置 256×256、patch 16、merge 2）：
+#   每帧每相机 (256/16/2)² = 8×8 = 64 个 token，3 相机共 192 个 token。
+# ⚠️ 与上面 vlm/action_expert 不同：这里的参数不必与 HF 完全一致，但改了就会与
+#    pretrained_ckpt 的视觉权重不匹配，只有从零训练或做权重转换时才改。
   vision:
     name: g05.models.g05.qwen35.vision.Qwen3_5VisionModel
+    # ViT 层数。
     depth: 24
+    # ViT 隐藏维度（比 LLM 小，最后靠 PatchMerger 投到 VLM 维度）。
     hidden_size: 1024
+    # 注意力头数；每头维度 = 1024/16 = 64。
     num_heads: 16
+    # 空间 patch 大小（16×16 像素）。
     patch_size: 16
+    # 时间维 patch 大小，配 Conv3D 一次吃 2 帧（单帧输入时会复制/补齐）。
     temporal_patch_size: 2
+    # 空间合并倍率：2×2 个 patch 合成 1 个 LLM token，token 数减少 4 倍。
     spatial_merge_size: 2
+    # 输入图像通道数（RGB）。
     in_channels: 3
+    # ViT FFN 中间维度，激活函数见 hidden_act（GELU-tanh，不是 LLM 的 SwiGLU）。
     intermediate_size: 4096
+    # PatchMerger 的输出维度，必须等于 ${model.model_arch.vlm.hidden_size}(2048)。
     out_hidden_size: 2048
+    # 可学习绝对位置编码的数量（2304 = 48×48 网格，即单帧最多 48×48 个 patch，
+    # 对应 768×768 像素；本配置 256×256 → 16×16 个 patch，余量充足）。
     num_position_embeddings: 2304
     hidden_act: gelu_pytorch_tanh
+
+    # 单张图产生的 token 数。null = 运行时根据 image_grid_thw 动态计算（推荐）。
+    # 仅在 PaliGemma 一类“固定 token 数”的骨干上才需要写死。
     num_image_tokens: null
+
+    # ── MEM（多帧视觉记忆）相关开关，默认全部关闭 ──
+    # 条件：上面的 cond_steps>1（数据侧 obs_size=6）+ 这里 temporal_freq>0，
+    # 两者同时满足时 G05ModelQwen35 才会走 MEM 路径（has_mem）。
+    # MEM 的做法是让 ViT 在时间维做注意力，把历史帧信息压进当前帧的 token，
+    # 再用 token drop 丢掉历史帧，因此 VLM 侧 token 数不变、无需改 VLM 配置。
+    # g05_pretrain_mem.pt 的训练配置用的是 temporal_freq=4：
+    # 24 层中第 4/8/12/16/20/24 层做时空（T+S）注意力，token drop 发生在最后一层。
+    # ⚠️ 本文件默认 temporal_freq=0（关闭），所以用 mem 权重时必须在 task 配置里
+    #    把它一并改成训练时的值，否则 ViT 不会做时间维注意力（多帧输入被当作纯空间序列）。
+    # 设计说明见 docs/architecture/qwen_mem_overview_zh.md；
+    # 部署多帧模型请用 scripts/serve_policy_mem.py（带 per-camera 帧缓冲）。
+
+    # 通道数（历史遗留字段，ViT 实际用 in_channels）。
     num_channels: 3
+    # 时间注意力频率：0 = 关闭（纯单帧空间注意力）；4 = 每 4 层做一次时空（T+S）注意力。
     temporal_freq: 0
+    # 时空注意力的组合方式："factorized"（共享一次 QKV，K=1 时严格退化为原 ViT）
+    # 或 "cascaded"（TimeSformer 风格，空间层重新投影 QKV，表达更强但不等价）。
     spacetime_mode: factorized
+    # 在第几层做 token drop（只保留当前帧、丢掉历史帧以控制 token 数）。
+    # null = 用 depth（即最后一层）；只在 temporal_freq > 0 时生效。
     token_drop_layer: null
+    # 时间位置编码是按多少帧预训练的。null = 不缩放；设 6 且实际帧数更多时会插值/外推。
     temporal_pe_pretrain_frames: null
+    # 历史遗留字段，当前代码未读取，保持 false。
     use_temporal_conv3d: false
+    # 是否把所有相机的 patch 合成一个变长序列一起做注意力（varlen 优化）。
+    # false = 逐相机处理（默认，memory 峰值更低、更稳）。
     batch_all_cameras: false
+
+  # 外部多模态投影器（PaliGemma 式 SigLIP+projector 才需要）。
+  # Qwen3.5 的 PatchMerger 已内置在 VisionModel 里，G05ModelQwen35 重写了构造逻辑
+  # 直接返回 None（不读这个键），写 null 只是占位，保证字段完整、便于换骨干。
   vision_projector:
     name: null
+
+  # ── 动作 tokenizer（离散化动作的编解码器）──
+  # 这两个键把独立的 tokenizer 配置组桥接进来（configs/tokenizer/actioncodec.yaml，
+  # 并在 configs/train.yaml 末尾通过 `model.tokenizer: ${tokenizer}` 复制到 model 下）。
+  #   action_tokenizer : tokenizer 类的路径（VQActionTokenizer）
+  #   AT_CONFIG        : 该类构造时需要的 vq_config（codebook、parts_meta、checkpoint 路径等）
+  # 之所以用插值，是为了让 task 配置里对 tokenizer.vq_config 的覆盖自动生效、不会两处不一致。
   action_tokenizer: ${model.tokenizer._target_}
   AT_CONFIG: ${model.tokenizer.vq_config}
+
+  # 历史遗留字段，当前代码未读取（保留仅为兼容老的 task/部署配置）。
   vla_training_strategy: vla-full-train
+
+  # 主干（VLM）学习率倍率：主干 lr = learning_rate × backbone_lr_multiplier。
+  # 视觉塔还会再乘一个 vision_lr_multiplier（通常 0.1，避免破坏预训练的视觉特征）。
   backbone_lr_multiplier: 1.0
+
+  # 文本部分的最大 token 数。模型侧只用在两处：FLOPs 估算的序列长度，
+  # 以及 pi05_ft_mode 的 prefix 对齐目标长度（该模式对 Qwen35 无效）。
+  # 真正做指令截断的是下面 processor.max_text_tokens —— 它通过插值引用同一个值，
+  # 所以正常情况改这里就够了。
   max_text_tokens: 160
+
+  # 一次前向实际喂进模型的图片张数 = 观测步数 T × 相机数。
+  # ${eval:...} 里做乘法，所以改 cond_steps 或 num_output_cameras 时会自动跟随。
+  # 例：单帧 1 × 3 相机 = 3 张；MEM 多帧 6 × 3 = 18 张。
   num_input_images: ${eval:'${model.model_arch.cond_steps} * ${model.processor.num_output_cameras}'}
+
+  # 每个相机的分辨率配置，引用 processor 里的同一份，保证数据处理与模型侧一致。
   camera_size_config: ${model.processor.camera_size_config}
+
+  # 历史遗留字段，当前代码未读取（每相机额外的图像 token 数）。
   num_extra_image_tokens_per_camera: 0
+  # 历史遗留字段，当前代码未读取（是否使用 LM head）。
   use_lm_head: true
+
+  # 【两条动作生成路径，可同时开启】
+  #   continuous_action      : 训练/推理走 Flow Matching（连续速度场 → 欧拉积分）
+  #   discrete_action        : 训练/推理走 AR（动作 token 的交叉熵 / 逐 token 采样）
+  #   return_continuous_action: 推理返回值里是否包含连续动作（部署方通常需要）
+  # 两者同时为 true（本配置）时，训练会同时优化 fm_loss 与 ce_loss，同一次前向产出两种动作；
+  # 上层可任选其一使用（见 G05Policy.generate_action 与各 task 配置）。
   discrete_action: true
   continuous_action: true
   return_continuous_action: true
+
+  # 历史遗留字段，当前代码未读取（动作是否 attend CoT）。
   action_attend_cot: false
+
+  # 是否预测 CoT（思维链）文本。true 时推理会先 generate_text 输出 CoT 再生成动作，
+  # 训练也会对文本部分算 CE 并统计 cot_accuracy。
+  # 本配置为 false：直接由图像+指令生成动作，与上面 input_preprocessor.pred_eov=false 配套。
   predict_cot: false
+
+  # 训练序列的最大长度（prefix + action/CoT suffix），超长会截断。
+  # 太大会浪费显存，太小会截掉动作 token 导致标签缺失。
   max_chunk_token_length: 1200
+
+  # 把 batch 内序列 pad 到固定长度的上限。null = 按 batch 内最长样本 padding。
+  # 原始用途是 FSDP/稳定 shape（利于 torch.compile），本仓库保持 null 更省显存。
   max_pad_token_length: null
+
+  # 传给模型侧 InputPreprocessor（token 编解码器）的四个开关：
+  #   input_action_corruption : 是否对输入动作做损坏增强（正则化，默认关）
+  #   pred_eov                : 是否预测 EOV 结束符（与 CoT 配套；CoT 任务设 true，
+  #                             例如 configs/task/bridge.yaml）
+  #   batchify_action         : 整批一起做动作离散化，保证 VQ/BAR 的分块对齐（建议保持 true）
+  #   pi05_ft_mode            : π0.5 式 prefix 对齐，仅 PaliGemma 骨干有效，Qwen35 恒为 false
   input_preprocessor:
     input_action_corruption: false
     pred_eov: false
     batchify_action: true
     pi05_ft_mode: false
+
+  # 【动作专家如何接收 VLM 的上下文】三选一（实现见 g05_model_qwen35.py 的
+  # _build_prefix_action_kv 与 build_action_mask_and_position_ids）：
+  #   "cross_attn_only" — 动作专家各层交叉注意力读取 VLM 的 prefix K/V，
+  #                       GatedDeltaNet 状态从零开始（本配置；要求 AE 全是 full_attention）
+  #   "recurrent_only"  — 只用 VLM 线性注意力传下来的循环状态，full 层只做自注意力
+  #   "both"            — 两者都用，条件最强、显存最高
+  # ⚠️ 该模式必须与 AE 的 layer_types 以及训练权重匹配（详见 g05_mem.yaml 的说明）。
   ae_vlm_condition_mode: cross_attn_only
+
+# -----------------------------------------------------------------------------
+# 10. 顶层补充项（与第 1~3 节同属 cfg.model.*，只是位置放在 model_arch 之后）
+# -----------------------------------------------------------------------------
+# DataLoader 的 worker 预取批次数；越大越能掩盖 CPU 抖动，代价是更占内存。
+# 注意该键在 model 下（不在 train.yaml），因为它与 batch_size/num_workers 一起调。
 prefetch_factor: 2
+
+# 【学习率曲线的时间分配】warmup_constant_cosine 的“恒定段”结束位置：
+# constant_end_ratio = 0.5 表示前 50% 的步数用于「预热 + 恒定」，后 50% 做余弦衰减。
+# 例：总步数 10000 → 0~500 预热、500~5000 恒定、5000~10000 余弦降到 lr×lr_min_ratio。
 constant_end_ratio: 0.5
+
+# 【预热步数的比例写法】⚠️ 它优先于上面的 warmup_steps：
+# finetune.py 里只要 warmup_ratio 不为 null，就会用
+#   warmup_steps = int(max_steps × warmup_ratio)
+# 覆盖掉 model.warmup_steps。也就是说本文件里 warmup_steps: 500 在默认情况下不生效，
+# 真实预热步数是总步数的 5%。想让 warmup_steps 生效，请在 task 配置里把
+# warmup_ratio 设为 null（很多 task 确实这么做了）。
 warmup_ratio: 0.05
+
+# -----------------------------------------------------------------------------
+# 11. processor：训练数据处理管线（由数据侧实例化，不是模型内部组件）
+# -----------------------------------------------------------------------------
+# 负责把 LeRobot 原始数据变成张量：图像 resize/归一化、动作与状态归一化、
+# 指令采样、动作/状态字典 → 扁平向量的合并（GroupedPaddingMerger）。
+# 注意它挂在 model 配置下，但由 src/g05/utils/data/processor_utils.py 的
+# build_processors() 实例化：当 data 配置里有 processors 时，会按
+#   merge(每个 embodiment 的 processor 配置, cfg.model.processor)
+# 合并，base（也就是本段）优先级更高 —— 所以这里写的值会覆盖 data 配置里的同名键。
+# 例：MEM 多帧任务要在 task 配置里把这里的 num_obs_steps 一起改成 6，只改 data.obs_size 不够。
 processor:
+  # 数据处理类。动作/状态归一化 + 交给 SamplesBuilder 组装模板。
   _target_: g05.data_processor.processor.galaxea_cot_processor.GalaxeaCoTProcessor
+
+  # 每次取几帧观测（T）。必须与数据侧 obs_size、模型侧 cond_steps 一致。
   num_obs_steps: 1
+
+  # 是否按离散动作处理：决定 action_state_merger 的约束（离散动作必须用
+  # PaddingActionMerger 这类“逐 part 对齐填充”的合并方式，不能用扁平拼接）。
   discrete_action: ${model.model_arch.discrete_action}
+
+  # 动作归一化统计量按“逐步（stepwise）”还是“全局（global）”使用：
+  # true  → 用每个未来时间步各自的统计量（动作 chunk 内分布不同，精度更高）
+  # 与数据侧的 stats 文件字段（stepwise_*/global_*）配套，改这里要保证统计量里有对应键。
   use_stepwise_action_norm: true
+
+  # 输出给模型的相机数（= 数据里用到的相机数量）。与 camera_size_config 的键数对应。
   num_output_cameras: 3
+
+  # 指令语言：Galaxea 数据的 task 字段形如 "中文@English"，
+  # false → 取英文部分，true → 取中文部分。
   use_zh_instruction: false
+
+  # 丢弃“高层指令”的概率。1.0 = 总是只给低层指令（[Low]: ...），
+  # 0.0 = 总是给高低两层（[High]: ..., [Low]: ...）。用于训练模型对两种输入都鲁棒。
   drop_high_level_prob: 1.0
+
+  # 填充用的 token id / 图像占位 token id，引用模型侧同一份值。
   pad_token_id: ${model.model_arch.pad_token_id}
   image_token_index: ${model.model_arch.image_token_index}
+
+  # tokenizer 加载参数（HF 路径 + 认证 token）。路径默认与 hf_processor_path 相同；
+  # 离线环境可在 task 配置里加 local_files_only: true。
   tokenizer_params:
     pretrained_model_name_or_path: ${model.model_arch.hf_processor_path}
     token: null
+
+  # 指令文本的最大 token 数，引用模型侧同一份值。
   max_text_tokens: ${model.model_arch.max_text_tokens}
+
+  # 输入相机数与每个相机的目标分辨率 [H, W]。
+  # 数据配置里也会写一份 shape_meta.shape，这里通过 camera_size_config 按 camera_type
+  # 自动解析并注入 Resize，二者保持一致即可；本段优先级更高。
   num_input_cameras: 3
   camera_size_config:
     exterior:
@@ -275,6 +877,17 @@ processor:
     wrist_right:
     - 256
     - 256
+
+  # 【动作/状态合并器】把按语义分组的字典转成一条扁平向量（也负责反向还原）。
+  # GroupedPaddingMerger 做“两级合并”：
+  #   第一级：按 merge_spec 在互斥的键里取第一个存在的（例如 left_arm 或 left_ee_pose），
+  #           并填充到这些候选键里的最大维度；
+  #   第二级：按 parts_meta 的顺序拼接成固定维度向量。
+  # 本配置用 configs/data/parts_meta/dual_arm_grouped_0409.yaml：
+  #   left_control(9) + left_gripper(1) + right_control(9) + right_gripper(1) = 20 维
+  # 该 20 维必须与 model_arch.action_dim / proprio_dim 及 tokenizer 的 parts_meta 一致。
+  # ${oc.load:...} 是 resolver：从另一个 YAML 里直接取 parts_meta / merge_spec 子树，
+  # 避免把同一份定义抄两遍。
   action_state_merger:
     _target_: g05.data_processor.transforms.action_state_merger.GroupedPaddingMerger
     merge: true

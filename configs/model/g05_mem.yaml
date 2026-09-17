@@ -1,37 +1,95 @@
-# G0.5 视觉记忆变体（mem）。继承 g05，只改两处以对齐 g05_pretrain_mem 权重：
-#   1) action_expert 用混合注意力（每 4 层 1 个 full，其余 linear），与 mem checkpoint 一致；
-#      装进 g05 的“全 full”配置会出现 108 missing(self_attn) / 162 unexpected(linear_attn)。
-#   2) pretrained_ckpt 指向 mem 权重软链。
-# 用法：在 task config 里 `override /model: g05_mem`，或命令行 `model=g05_mem`。
+# =============================================================================
+# configs/model/g05_mem.yaml — G0.5 视觉记忆变体（mem）
+# =============================================================================
+#
+# 【这个文件是什么】
+# 它是 configs/model/g05.yaml 的一份“薄差异补丁”，只改两处，用来对齐内部基座权重
+# g05_pretrain_mem.pt（该权重在预训练时用的是带视觉记忆 / MEM 的结构）。
+# 除下面两处外，所有字段都沿用 g05.yaml —— 改 g05.yaml 会自动影响本文件。
+#
+# 【继承机制】Hydra 的 defaults 列表：
+#   defaults:
+#     - g05       ← 先加载同配置组（model）下的 g05.yaml 作为基线
+#     - _self_    ← 再应用本文件里写的内容（优先级更高，覆盖基线）
+# 所以这里只写“与 g05 不同的键”，其余一律继承，避免复制粘贴导致两份配置漂移。
+#
+# 【改了什么】
+#   1) action_expert.layer_types：由 g05 的“24 层全 full_attention”改成
+#      “每 4 层一组：3 层 linear_attention(GatedDeltaNet) + 1 层 full_attention”，
+#      与 mem checkpoint 的结构一致。
+#      ⚠️ 这是结构差异，加载时对不上会直接报错：把 mem 权重装进 g05 的全 full 结构，
+#         会出现 108 个 missing(self_attn.*) 与 162 个 unexpected(linear_attn.*)；
+#         反过来把普通 g05 权重装进本配置，则是对称的反向不匹配。
+#   2) pretrained_ckpt：指向 mem 权重（内部集群路径，换环境需改成自己的路径）。
+#
+# 【没改但容易误解的地方】
+#   * “视觉记忆 / MEM 多帧”真正的开关不在本文件，而在数据侧：
+#     configs/data/<task>.yaml 的 obs_size（观测帧数）与 obs_stride_second（帧间隔，单位秒），
+#     再加上 task 配置里的 model.processor.num_obs_steps（模型侧 processor 的优先级更高，
+#     必须一起改成同样的帧数）；可选再开 model_arch.vision.temporal_freq > 0，
+#     让 ViT 在时间维真正做时空注意力。详见 docs/architecture/qwen_mem_overview_zh.md。
+#   * ae_vlm_condition_mode 仍继承 g05 的 "cross_attn_only"：动作专家的 full_attention 层
+#     交叉注意力读取 VLM prefix 的 K/V，而 GatedDeltaNet 层从零状态开始（不继承 VLM 循环状态）。
+#   * 多帧推理请用 scripts/serve_policy_mem.py（带 per-camera 帧缓冲）；
+#     单帧的 serve_policy.py 会把同一帧复制 K 份，喂给 MEM 模型语义不对。
+#
+# 【怎么用】
+#   * task 配置里：defaults 增加 `override /model: g05_mem`
+#   * 命令行临时切换：bash scripts/run/finetune.sh 8 r1pro model=g05_mem
+#   * 改权重路径：    ... model=g05_mem model.pretrained_ckpt=/your/path/mem.pt
+
 defaults:
+  # 同配置组（model）下的基线配置。
   - g05
+  # 本文件自身内容，放在最后 → 覆盖上面的基线。
   - _self_
 
+# mem 基座权重路径（内部集群软链）。换到本地 / 其他集群时必须改掉，
+# 否则 finetune / eval / serve 会在加载 checkpoint 时报文件不存在。
+# 它同样是完整 VLA 权重（VLM + Vision + Action Expert），加载逻辑与 g05.yaml 中
+# 的 pretrained_ckpt 完全一致（只取权重，优化器状态从 0 开始）。
 pretrained_ckpt: /efm-vepfs/group-jt/research/lyc/CruxAI/checkpoints/g05_pretrain_mem.pt
 
+# 只覆盖 action_expert 这一段；Hydra 会把这份子配置与 g05.yaml 里同名的子树
+# 递归合并，因此 vlm / vision / fm / ar / processor 等其余配置原样继承。
 model_arch:
   action_expert:
+    # 【唯一的真正结构改动：层类型】
+    # 24 层 = 6 × (3×linear_attention + 1×full_attention)，与 VLM 的排布规律一致：
+    #   * full_attention 层（第 4/8/12/16/20/24 层）：做标准全局注意力，同时承担
+    #     跨注意力读取 VLM prefix K/V 的职责（AE 的条件化入口）。
+    #   * linear_attention 层（GatedDeltaNet）：近似线性复杂度的注意力，
+    #     参数为 conv1d / in_proj / out_proj / A_log / dt_bias / norm。
+    # 组内排布与 g05 的 VLM 段相同，因此两处可以互相参照阅读。
+    # ⚠️ 必须整段替换，不能只改某几行：层的数量与顺序共同决定权重形状，
+    #    少一层或多一层都会在 load_state_dict 时报 shape mismatch。
     layer_types:
+      # 第 1 组
       - linear_attention
       - linear_attention
       - linear_attention
       - full_attention
+      # 第 2 组
       - linear_attention
       - linear_attention
       - linear_attention
       - full_attention
+      # 第 3 组
       - linear_attention
       - linear_attention
       - linear_attention
       - full_attention
+      # 第 4 组
       - linear_attention
       - linear_attention
       - linear_attention
       - full_attention
+      # 第 5 组
       - linear_attention
       - linear_attention
       - linear_attention
       - full_attention
+      # 第 6 组
       - linear_attention
       - linear_attention
       - linear_attention

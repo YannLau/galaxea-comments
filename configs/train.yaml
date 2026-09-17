@@ -1,67 +1,216 @@
 # @package _global_
+# =============================================================================
+# configs/train.yaml — Hydra 顶层配置入口（Top-level entry）
+# =============================================================================
+#
+# 【这个文件是什么】
+# 它是本仓库训练/评测/部署脚本共用的“主配置文件”（默认设置表），所有入口都以它为基础：
+#   * 训练：scripts/finetune.py          —— @hydra.main(config_name="train.yaml")
+#   * 离线评测：scripts/eval_open_loop.py —— 通过 ckpt_utils.load_config_from_task_yaml()
+#   * 策略服务：scripts/serve_policy*.py  —— 同上，读取运行目录里的 .hydra/config.yaml
+#
+# 【怎么被使用】
+# Hydra 会先读本文件，再叠加 `task=<任务名>` 指定的 configs/task/<任务名>.yaml；
+# 由 task 配置去挂载 model / tokenizer / data 三组配置。层级关系：
+#   train.yaml（本文件，全局默认）
+#     └── configs/task/<task>.yaml    任务差异：超参、数据、tokenizer 差异
+#           ├── configs/model/g05.yaml            唯一的模型结构配置
+#           ├── configs/tokenizer/actioncodec.yaml 唯一的动作 tokenizer
+#           └── configs/data/<task>.yaml          每个任务自包含的数据/处理器配置
+# 所以：想改学习率、batch size、epoch 等，请改 configs/task/<task>.yaml 里的 `model:`；
+#       本文件只放“所有任务共享的训练/评测开关”。（另见 configs/QUICK_START.md）
+#
+# 【怎么启动 / 怎么临时覆盖】
+#   bash scripts/run/finetune.sh <num_gpus> <task> [key=value ...]
+#   # 例：8 卡跑 r1pro，并把 batch size 改成 8、评测间隔改成 200
+#   bash scripts/run/finetune.sh 8 r1pro model.batch_size=8 eval_steps=200
+# 命令行里的 `key=value` 是 Hydra override，优先级最高，可覆盖本文件任意键。
+#
+# 【语法提醒】
+# ${...} 是 Hydra/OmegaConf 插值（引用其他键或调用 resolver），
+# 例如 ${oc.env:VAR,默认值} 读环境变量、${now:%Y-%m-%d} 取当前时间。
 
-# specify here default configuration
-# order of defaults determines the order in which configs override each other
+# 说明本文件的键都挂在配置树根部（global package），
+# 因此下面写的 `seed`、`eval_steps` 在代码里读作 `cfg.seed`、`cfg.eval_steps`。
+# 注意：这一行必须位于文件最前面（Hydra 只会在头部区域内解析 @package 指令）。
+
+# -----------------------------------------------------------------------------
+# defaults：Hydra 的“配置组合 / 继承”列表
+# -----------------------------------------------------------------------------
+# 规则：列表顺序 = 合并顺序，越靠后优先级越高（后面的值覆盖前面的值）。
+#   - _self_     该占位符代表“本文件自己写的内容”。它被放在最前面，
+#                意味着本文件里的键都可以被后面加载的 group/task 覆盖
+#                （例如 configs/task/droid.yaml 覆盖 exp_name 和 eval_steps）。
+#   - data/model/tokenizer/task
+#                四个 config group 的“占位声明”，后面没有写值（等于 null），
+#                含义是“默认不加载任何文件，但该 group 可以被覆盖选择”，
+#                具体加载哪个文件由被选中的 task 配置决定，例如
+#                configs/task/libero.yaml：
+#                  defaults:
+#                    - override /model: g05
+#                    - override /tokenizer: actioncodec
+#                    - override /data: libero
+#                    - _self_
+#                （task 文件自己的 _self_ 放在最后 → task 里的值又覆盖上面三组）
+# 选择任务（二选一，效果相同）：
+#   task=libero                    # Hydra 简写，自动找 configs/task/libero.yaml
+#   task=configs/task/libero.yaml  # 直接给相对路径
 defaults:
-  - _self_
-  - data:
-  - model:
-  - tokenizer: null
-  - task:
+  - _self_ # 本文件自身内容（放最前 → 可被下面这些 group / task 覆盖）
+  - data: # 数据配置占位；实际值由 task 配置的 `override /data: <name>` 提供
+  - model: # 模型配置占位；实际值由 task 配置的 `override /model: g05` 提供
+  - tokenizer: null # tokenizer 占位（显式写 null，语义与空值相同）
+  - task: # 任务配置占位；运行时通过命令行 `task=<name>` 指定
 
+# -----------------------------------------------------------------------------
+# 1. 复现性与断点续训
+# -----------------------------------------------------------------------------
+
+# 全局随机种子。训练开始时会调用 set_global_seed(cfg.seed)（scripts/finetune.py），
+# 同时设置 python / numpy / torch 的随机数以及 DataLoader worker 的种子。
+# 作用：让“同一份代码 + 同一份数据”的实验尽量可复现（多卡下仍可能有极细微差异）。
 seed: 7
 
+# 是否使用 PyTorch 的 fused AdamW：把优化器更新融合成单个 CUDA kernel，
+# 通常略快、略省显存。仅在 model.use_8bit_optimizer=false 时可用；
+# 若两者同时为 true，训练会直接报错（两者互斥，见 scripts/finetune.py）。
 use_fused_optimizer: False # fused=True for AdamW: single fused CUDA kernel for optimizer step
+
+# 断点续训：填写一个“带完整训练状态”的 checkpoint 路径来继续训练，例如
+#     <run_dir>/checkpoints/step_20000.pt
+# 其中 run_dir = ${G05_OUTPUT_DIR}/<task>/<exp_name>（即 ${output_dir}）。
+# ⚠️ 请写 checkpoints/step_N.pt，不要写 run_dir/last.pt：代码用
+#    Path(resume_ckpt).parent.parent / "dataset_stats.json" 去找数据统计量，
+#    只有 checkpoints/ 的上一级才是 run_dir。另外 resume 要求该文件确实保存了
+#    优化器/调度器状态（即由 checkpointing_steps 触发的定期保存，而不是训练结束
+#    时那个 inference-only（只含权重）的最终保存）。
+# 与 model.pretrained_ckpt 的区别（新手最容易混淆）——两者是同一份文件格式，
+# 差别在于“文件里带了哪些状态”和“加载时用哪些状态”：
+#   * resume_ckpt        ：同一份 checkpoint 里额外读取 优化器状态 + 学习率调度器 +
+#                          step/epoch/batch_idx（开 EMA 时还有 EMA 权重），
+#                          用于“训练被打断后接着跑”，学习率曲线与数据迭代位置都不断档。
+#   * model.pretrained_ckpt：只从中取权重（model_state_dict）做微调，优化器/step 从 0 开始；
+#                          完整 checkpoint 或 --strip 后的 model_state_dict.pt 都能用。
+# null = 从头开始（或仅从 pretrained_ckpt 初始化权重）。
 resume_ckpt: null
+
+# 实验名：默认取环境变量 EXP_NAME，未设置时用当前时间戳（如 2026-09-16_10-31-02）。
+# 它决定了两个位置，因此建议改成一个有意义的名字：
+#   * 输出目录：${G05_OUTPUT_DIR}/<task>/<exp_name>
+#   * 日志平台上的实验名：${logger.experiment_name}
+# 用法示例：EXP_NAME=my_run bash scripts/run/finetune.sh 8 r1pro
+#           bash scripts/run/finetune.sh 8 r1pro exp_name=my_run   # 等效
 exp_name: "${oc.env:EXP_NAME, ${now:%Y-%m-%d_%H-%M-%S}}"
+
+# 本次运行的输出目录：checkpoint、train.log、周期性评测出的图片等都写在这里。
+# ${hydra:runtime.output_dir} 是 Hydra 的运行时变量，等于下面 hydra.run.dir 的值，
+# 训练代码用它来保存权重、配置 accelerate、给日志平台指定目录。
 output_dir: ${hydra:runtime.output_dir}
 
-# checkpointing
+# -----------------------------------------------------------------------------
+# 2. 训练循环相关
+# -----------------------------------------------------------------------------
+
+# 每训练多少个 step 保存一次中间 checkpoint（含优化器/调度器状态，可续训）。
+# 训练结束时会额外保存一次最终权重（只含模型，用于推理/部署）。
+# 注意：step 计的是“优化器更新次数”，不是 micro-batch 数，
+#       梯度累积 model.grad_accumulation_steps > 1 时一个 step 会吃掉更多样本。
 checkpointing_steps: 2000
 
-# eval
+# 周期性评测间隔：每 `eval_steps` 个 step，在验证集上跑一次 rollout 并计算动作误差等指标，
+# 结果以 `eval/...` 为前缀写进日志平台，同时保存预测可视化。
+# 值越小曲线越细但训练越慢（评测要与训练抢算力）；值越大训练越快但曲线越粗。
+# 细节点：评测只发生在同时满足 `step % eval_steps == 0` 且该 step 也是日志 step
+#         （`step % logger.log_steps == 0`）且日志未关闭时；`--dry-run` 会把它设为 1。
+# 验证集来自数据配置里的 val_set_proportion（例如 libero=1e-4），不参与梯度更新。
 eval_steps: 100
 
-# logger configuration - supports swanlab, wandb, or none
+# -----------------------------------------------------------------------------
+# 3. 日志 / 实验追踪（wandb 或 swanlab）
+# -----------------------------------------------------------------------------
+# 由 scripts/finetune.py 的 init_experiment_tracker() 读取，通过 accelerate 的统一接口
+# 初始化，所以只要改 type 就能切换平台，其余字段含义基本一致。
 logger:
-  type: "wandb" # Options: "swanlab", "wandb", null
-  log_steps: 10
-  task: ${hydra:runtime.choices.task}
-  project: "${oc.env:WANDB_PROJECT,g05}" # Will be auto-set from task name
-  experiment_name: ${split:${logger.task},-1}_${exp_name} # Will be auto-set from task name
+  type: "wandb" # 追踪平台："wandb" | "swanlab" | "none"（"none" = 关闭日志上报，训练照常进行）
+  log_steps: 10 # 每多少 step 向平台推送一次训练指标（loss / lr / grad_norm / 准确率等）
+  task: ${hydra:runtime.choices.task} # 当前选中的 task 名（如 libero），自动获得，一般不用改
+  project: "${oc.env:WANDB_PROJECT,g05}" # 平台上的项目名，默认 g05，可用环境变量 WANDB_PROJECT 覆盖
+  experiment_name: ${split:${logger.task},-1}_${exp_name} # 平台上的实验名，如 libero_2026-09-16_10-31-02
 
-  # Common fields (interpretation depends on type):
+  # 通用字段（不同平台解释不同）：
   # - For swanlab: mode can be "cloud", "local", "disabled"
   # - For wandb: mode can be "online", "offline", "disabled"
+  # offline/disabled 适合没有外网或不想上传数据的场景（本地仍会写日志目录）。
   mode: "online"
 
   # - For swanlab: workspace is the SwanLab workspace name
   # - For wandb: workspace is the WandB entity/team name (optional)
   workspace: "${oc.env:WANDB_ENTITY,Galaxea-AI}"
 
+  # 日志文件输出目录；null 时自动使用 ${output_dir}/wandb 或 ${output_dir}/swanlab。
   # Output directory for logs (only used for wandb, auto-set to ${output_dir}/wandb or ${output_dir}/swanlab)
   dir: null
 
-# eval
+# -----------------------------------------------------------------------------
+# 4. 周期评测 / 离线评测 / 部署共用字段
+# -----------------------------------------------------------------------------
+# 下面这些键不只训练脚本会读：eval_open_loop / serve_policy 也会从本文件
+# （或某个运行目录下的 .hydra/config.yaml）读取，所以放在顶层共享。
+
+# 验证集 DataLoader 的 batch size。与训练的 model.batch_size 相互独立：
+# 评测不做反向传播、显存占用更小，通常可以设得更大一些。
+# eval 用多少样本来自数据配置的 val_set_proportion（例如 1e-4）。
 batch_size_val: 16
+
+# 离线开放式评测（scripts/eval_open_loop.py）每次评测取多少个 episode 做统计/可视化；
+# null 表示使用全部 episode。训练脚本不使用该键。
 eval_episodes_num: 1
+
+# 要评测/部署的 checkpoint 路径。训练时保持 null；
+# 跑 scripts/run/eval_open_loop.sh、scripts/serve_policy*.py 时用 `--ckpt_path` 传入，
+# 脚本会把它写回 cfg.ckpt_path（这些入口同样以 train.yaml 为主配置）。
 ckpt_path: null
+
+# 以下两个键当前仓库代码没有读取（属于历史遗留的仿真/真机部署字段），
+# 保留是为了兼容外部部署 harness；改或删都不影响本仓库的训练/评测流程。
 env: R1ProBlocksStackEasy
 target_controller_type: bimanual_relaxed_ik
 
+# -----------------------------------------------------------------------------
+# 5. Hydra 运行时配置
+# -----------------------------------------------------------------------------
 hydra:
-  verbose: false # Show full traceback for instantiate errors
+  verbose: false # 设为 true 时打印更完整的异常堆栈，排查 instantiate / 配置错误时很有用
   run:
-    # Use exp_name when provided; otherwise use a timestamp.
+    # 本次运行的输出目录：
+    #   ${G05_OUTPUT_DIR}/<task>/<exp_name>
+    # G05_OUTPUT_DIR 是必须设置的环境变量（见 .env.example 与 README 的 Quick Start）：
+    # 它没有默认值，若忘记设置会解析成无效路径（形如 "None/<task>/<exp>"），
+    # 因此启动训练前请先 `source .env` 或手动 export。
+    # 该目录同时存放 checkpoint、train.log 和周期性评测产物。
+    # 使用 exp_name：命令行/环境变量给了就用它，没给就用时间戳。
     dir: "${oc.env:G05_OUTPUT_DIR}/${hydra:runtime.choices.task}/${exp_name}"
   job_logging:
     handlers:
       file:
+        # Hydra 的文件日志：写到本次运行目录下的 train.log。
+        # （scripts/finetune.py 会在同一目录再挂一个 FileHandler，两者互不冲突。）
         filename: ${hydra.runtime.output_dir}/train.log
 
+# 为日志平台 / Hydra 作业预留的标签字段；本仓库代码未读取，保持 null 即可。
 tags: null
 
-# Tokenizer bridge: task configs override root `tokenizer:` key;
-# model code accesses via `cfg.model.tokenizer`.
+# -----------------------------------------------------------------------------
+# 6. 把 tokenizer 挂到 model 下（桥接）
+# -----------------------------------------------------------------------------
+# 背景：tokenizer 是独立的 config group，内容挂在 `tokenizer.*`
+# （来自 configs/tokenizer/actioncodec.yaml）；而模型代码习惯通过
+# `cfg.model.tokenizer` 访问它，例如 configs/model/g05.yaml 里的
+#   action_tokenizer: ${model.tokenizer._target_}
+#   AT_CONFIG: ${model.tokenizer.vq_config}
+# 因此这里把根部的 `tokenizer` 节点整体复制一份到 `model.tokenizer`。
+#
+# `${tokenizer}` 是 Hydra 插值：引用同一配置树中 `tokenizer` 的值，
+# 所以 task 配置里对 `tokenizer.vq_config.*` 的覆盖会同时体现在两处，永远不会不一致。
 model:
   tokenizer: ${tokenizer}

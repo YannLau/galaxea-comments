@@ -1,68 +1,312 @@
 # @package _global_
+# =============================================================================
+# configs/task/r1pro.yaml — R1 Pro（双臂 + 下半身，关节空间）微调任务配置
+# =============================================================================
+#
+# 【这个文件是什么】
+#   它是 Hydra 的“任务差异文件”：只写 R1 Pro 这条训练流水线与其他任务不同的键，
+#   其余全部继承共享配置。配置组合链路（另见 docs/architecture/config_zh.md）：
+#     configs/train.yaml                        顶层入口：seed / eval_steps / logger / hydra 运行时
+#       └── configs/task/r1pro.yaml             ← 本文件：R1 Pro 的训练超参 + tokenizer 差异
+#             ├── configs/model/g05.yaml             唯一的模型结构配置（Qwen3.5-2B VLA）
+#             ├── configs/tokenizer/actioncodec.yaml 唯一的动作 tokenizer 配置
+#             └── configs/data/r1pro.yaml            R1 Pro 数据集 + 处理器（自包含）
+#
+#   一句话概括本任务：以 g05-base 预训练权重初始化，在 R1 Pro 的双臂关节空间数据上做
+#   全参数微调。动作空间是 grouped 27 维
+#   （左臂控制 9 | 左夹爪 1 | 右臂控制 9 | 右夹爪 1 | 下半身 7），
+#   整网 fp32 训练，10 个 epoch，AR（离散动作 token）与 Flow-Matching（连续动作）两条
+#   输出路径同时优化。
+#
+# 【谁读它 / 怎么跑】
+#   * 训练     : scripts/finetune.py（@hydra.main(config_name="train.yaml")，用 task=r1pro 选中本文件）
+#   * 离线评测 : scripts/eval_open_loop.py
+#   * 真机部署 : scripts/serve_policy_mem.py + experiments/r1pro；
+#                部署侧读的是训练产物里的 .hydra/config.yaml（= 本文件解析后的结果），
+#                所以训练与部署的超参天然一致，不会“训练一套、部署一套”。
+#   * 调试     : python tools/resolve_config.py r1pro --key model    # 打印解析后的最终配置
+#                bash scripts/run/finetune.sh 1 r1pro --dry-run --max_datasets 1
+#
+#   常用启动命令（第一个参数是 GPU 数）：
+#     bash scripts/run/finetune.sh 8 r1pro                                   # 正式训练
+#     bash scripts/run/finetune.sh 1 r1pro --test --max_datasets 1 model.max_steps=10   # 单卡冒烟
+#     bash scripts/run/finetune.sh 8 r1pro model.batch_size=4 model.learning_rate=2e-05  # 临时覆盖
+#
+# 【覆盖（合并）规则 —— 新手最容易踩的点】
+#   defaults 列表里的每一项都是“先加载”，`_self_` 代表本文件自身内容且写在最后，
+#   意味着本文件显式写出的键会覆盖上面三组里的同名键；字典是“递归合并”，不是整体替换。
+#   优先级从低到高：
+#     configs/train.yaml
+#       < configs/model/g05.yaml + configs/tokenizer/actioncodec.yaml + configs/data/r1pro.yaml
+#       < 本文件
+#       < 命令行 override（bash ... model.batch_size=4）
+#   所以：改“R1 Pro 专属”的取值写在本文件；改“所有任务通用”的默认值才去动
+#   configs/model/g05.yaml 或 configs/train.yaml（详细原则见 configs/QUICK_START.md）。
+#
+# 【语法提醒】
+#   ${...} 是 OmegaConf 插值：${model.batch_size} 引用同一配置树里的另一个键（改一处、处处同步）；
+#   ${oc.load:文件,键} 是仓库自定义 resolver，用来从别的 YAML 里读取子树，避免同一份定义抄两遍。
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 0. defaults：本任务挂载哪几份共享配置
+# -----------------------------------------------------------------------------
 defaults:
+# 用 configs/model/g05.yaml 替换 train.yaml 里 model 组的空占位（全仓库唯一的模型结构配置）
 - override /model: g05
+# 用 configs/tokenizer/actioncodec.yaml 替换 tokenizer 组占位（唯一的动作 tokenizer 配置）
 - override /tokenizer: actioncodec
+# 用 configs/data/r1pro.yaml 替换 data 组占位（R1 Pro 自包含的数据集与处理器）
 - override /data: r1pro
+# _self_ 放在最后 ⇒ 本文件自身的键在三个组之后合并，从而可以覆盖它们
 - _self_
+
+# -----------------------------------------------------------------------------
+# 1. 集群 / 多节点开关（R1 Pro 训练保留项）
+# -----------------------------------------------------------------------------
+# 【多节点数据分片】true = 按节点把 dataset_dirs 分给不同节点，每个节点只加载自己那份数据，
+# 从而缩短大集群下的数据初始化时间。配套逻辑在
+# src/g05/data/mixture_lerobot_dataset.py：
+#   sync_weights_for_sharding() 跨节点同步“归一化后的数据集权重”（各节点长度不同时保证一致），
+#   cap_length_for_sharding()   把各节点的 epoch 逻辑长度对齐到全局最小值，避免节点间进度漂移。
+# ⚠️ 当前快照的 Python 代码里没有读取这个键的位置（全仓搜索只命中 r1lite/r1pro/r1pro_wbc
+#    三份 task 配置），也就是说单机多卡训练时它不产生任何效果；只有集群侧把分片逻辑接上时才生效。
+#    保持 false = 每个进程各自加载完整数据（单机 8 卡走的正是这条路径）。
 shard_datasets_by_node: false
+
+# 【FSDP 相关开关】下面 5 个键是为“显存不足时用 FSDP 把模型切到多卡”准备的集群开关。
+# 本仓库的 scripts/finetune.py 目前只走 DDP 路径（见其中的 DDP(...) 调用），
+# 这几个键在 Python 侧没有任何读取点，改它们不会改变训练行为；
+# docs/deployment/model_debug_logging.md 里出现的 use_fsdp 属于分布式调试的历史遗留变量。
 use_fsdp: false
+# FSDP 分片策略：hybrid = 层内+层间混合分片（最省显存）、full_shard = 全切分、
+# shard_grad_op = 只切梯度与优化器状态。仅在 use_fsdp=true 的代码路径里才有意义。
 fsdp_sharding_strategy: hybrid
+# FSDP 混合精度（bf16 计算 + fp32 通信）：与模型侧的 model.enable_bf16_training 是两套独立开关。
 fsdp_mixed_precision: false
+# 提前预取下一层参数，用通信掩盖计算，代价是显存峰值上升。
 fsdp_prefetch: true
+# 前向结束后立刻重新分片参数（ZeRO-3 风格）：最省显存、通信量最大。
 fsdp_reshard_after_forward: true
+
+# -----------------------------------------------------------------------------
+# 2. vlm：VLM 协同训练（vision-language cotrain）预留块 —— 当前不生效
+# -----------------------------------------------------------------------------
+# 这一整块在当前训练链路里不会被读取（全仓搜索 cotrain / vlm_batch_ratio 只命中
+# r1lite / r1pro / r1pro_wbc 三份 task 配置，src/ 与 scripts/ 无任何读取点），
+# 属于早期“视觉语言数据 + 机器人数据联合训练”分支留下的配置，保留是为了兼容外部代码。
+# 逐项含义（仅供了解，改它不会改变本仓库的训练行为）：
+#   cotrain         : 是否把 VLM 图文数据与机器人数据混在同一个 step 里联合训练
+#   batch_size      : 该分支自己的 batch；${model.batch_size} 是插值，等于本文件的 model.batch_size（8）
+#   num_workers     : 该分支 DataLoader 的取数进程数
+#   vlm_batch_ratio : 一个 batch 中 VLM 数据的占比（0.2 = 20%）
+#   loss_weight     : 该分支损失在总损失里的权重
 vlm:
   cotrain: false
   batch_size: ${model.batch_size}
   num_workers: 4
   vlm_batch_ratio: 0.2
   loss_weight: 1.0
+
+# -----------------------------------------------------------------------------
+# 3. datastatics_path：数据归一化统计量（dataset_stats.json）的路径
+# -----------------------------------------------------------------------------
+#   null  → 不做任何预置：训练一开始用训练集现场统计 action/state 的统计量，
+#           并保存到本次运行目录 ${output_dir}/dataset_stats.json
+#           （见 scripts/finetune.py 的 "fresh (computed from training data)" 分支）。
+#           用自己的数据微调 R1 Pro 时走的就是这条路径，可以保证归一化量只来自本次数据。
+#   有路径 → 从该 JSON 读取统计量；若缺少某个 embodiment_type，则只补算缺的那部分。
+# 与它相关的另一个开关是 model.use_pretrained_norm_stats（g05.yaml 里为 false）：
+# 设为 true 时会改用 pretrained_ckpt 所在运行目录下的 dataset_stats.json。
+# 两者按需二选一即可，别指望同时生效。
 datastatics_path: null
+
+# -----------------------------------------------------------------------------
+# 4. logger：日志平台（只覆盖 3 个字段，其余继承 configs/train.yaml）
+# -----------------------------------------------------------------------------
+# 最终由 src/g05/utils/training/train_utils.py 的 init_experiment_tracker() 通过 accelerate
+# 统一初始化；这里没写的 log_steps / project / experiment_name / dir 等都继续沿用 train.yaml。
+#   type=wandb    : 上报到 Weights & Biases
+#   mode=offline  : 只写本地文件（${output_dir}/wandb），不联网上传 —— 集群/内网训练的常见选择；
+#                   想上传改成 online（需要 WANDB_API_KEY），改成 disabled 或 type=none 则完全关闭上报
+#   workspace=null: 覆盖 train.yaml 里的 ${oc.env:WANDB_ENTITY,Galaxea-AI}，即不指定 wandb entity
+#                   （用当前登录账号的默认 entity）。注意 swanlab 模式下 workspace 才是团队空间名。
 logger:
   type: wandb
   mode: offline
   workspace: null
+
+# -----------------------------------------------------------------------------
+# 5. deploy_checkpoint：部署产物开关
+# -----------------------------------------------------------------------------
+# 仓库内的 Python 代码没有读取点（全仓搜索只命中 r1lite / r1pro / r1pro_wbc 三份 task 配置），
+# 它是外部部署 harness 使用的标记位，保持 true 即可。
+# 本仓库真机部署的实际做法是：
+#   scripts/serve_policy_mem.py --ckpt_path <run_dir>/checkpoints/model_state_dict.pt ...
+#   再在 experiments/r1pro 里用 ROS2 客户端连接（见 README_zh.md 的「R1 Pro」小节）。
 deploy_checkpoint:
   enabled: true
+
+# -----------------------------------------------------------------------------
+# 6. tokenizer：R1 Pro 的动作 tokenizer 差异
+# -----------------------------------------------------------------------------
+# 其余字段继承 configs/tokenizer/actioncodec.yaml；本节决定“离散动作如何变成 token”，
+# 直接决定 AR 分支的序列长度与含义。它是本文件里改动风险最高的一节（见文末风险速查）。
 tokenizer:
   vq_config:
+    # 【是否使用分块自回归（BAR）】false = 不用 BAR，AR 分支按普通方式逐 token 生成/监督。
+    # ⚠️ 必须与 model.model_arch.ar.block_wise_autoregressive 取同一个值：
+    #    G05Policy 初始化时会断言二者一致（src/g05/models/g05/g05_policy.py 里的
+    #    "BAR config mismatch" 检查），运行时以 tokenizer 的真实配置为准。
+    #    actioncodec.yaml 的默认值是 true（BAR），R1 Pro 改用 false。
     block_wise_autoregressive: false
+    # BAR 的块大小（每个 block 含多少 token）。**仅在 block_wise_autoregressive=true 时生效**，
+    # 这里 BAR 已关闭，所以本值不会被读取，写什么都不会改变训练/推理行为（保留以便对照其它任务）。
     block_size: 8
+    # 【运行时启用的残差码本层数】tokenizer 的网络本身有 4 层码本
+    # （actioncodec.yaml → model_arch.n_codebooks: 4），但编码/解码只用前 N 层：
+    # 第 1 层承载动作主体、后续层补细节。取 2 可让 action token 数量减半、序列更短更好学，
+    # 代价是动作重建精度略降（r1pro / r1lite / libero / robotwin 等都取 2）。
+    # ⚠️ 它会直接改变 action_token_len（进而改变 block 数与位置编码），换值必须重训。
     num_residuals: 2
+
+    # 【哪些 key 走“规则路径”而不是神经网络】按子串匹配：key 名包含 "gripper" 的
+    # （left_gripper / right_gripper）不经过 VQ-VAE，而是先按阈值二值化成开关序列，
+    # 再用 ConstrainedSequenceTokenizer 编码成固定 2 个 token；其余 key
+    # （left_control / right_control / lower_body）走 VQ-VAE。
+    # 与 actioncodec.yaml 的默认值一致，写在这里让本文件可以自解释。
     rule_based_key_patterns:
     - gripper
+    # 【规则路径的二值化阈值】动作在这一步已经过数据侧归一化（夹爪通常落在 [-1, 1] 附近），
+    # 0.0 表示以 0 为界：>= 0 记为 1（张开），< 0 记为 0（闭合）。
     rule_based_binarize_threshold: 0.0
+
+    # 【是否在序列里插入 part 组标记】true = 每个 part 的 token 段前带一个组标记
+    # （如 <left_control_0>）。作用有二：
+    #   (1) 序列里能直接看出每段 token 属于哪个部位；
+    #   (2) 允许模型只生成其中一部分 part（配合下面的 dropout_noop_parts）。
+    # 它要求 use_extra_tokens=true（actioncodec.yaml 默认为 true，否则代码直接抛 NotImplementedError）。
     use_group_markers: true
+    # 【是否打乱 part 的生成顺序】false = 固定按 parts_meta 的书写顺序生成：
+    # left_control → left_gripper → right_control → right_gripper → lower_body。
+    # 必须与训练动作 tokenizer 时的取值保持一致，否则标记与 token 位置会对不上。
     group_order_shuffle: false
+    # 【是否丢弃“整段无动作”的 part】true = 编码时把全 0 / 全 padding 的 part 从序列里去掉，
+    # 让序列更短，并训练模型“该不出手就不出手”。例如只动一只手臂时，另一侧可以整段缺席。
     dropout_noop_parts: true
+    # 【缺席 part 的填充值】解码时若某个 part 没有被生成：
+    #   * 规则类 key（夹爪）→ 填本值 -100.0，作为“本次不下发这个 part”的哨兵值；
+    #   * 神经网络类 key（left_control / right_control / lower_body）→ 固定填 0.0（不产生位移）。
+    # 不写该键时默认 null → 夹爪也会填 0.0（与“闭合到 0”混淆），所以这里显式给 -100。
     absent_key_fill_value: -100.0
+
+    # 【part 布局 —— 本文件最关键的 27 维定义】
+    # 书写顺序 = 扁平向量的拼接顺序 = 数据侧 GroupedPaddingMerger 的输出顺序：
+    #   left_control(9) | left_gripper(1) | right_control(9) | right_gripper(1) | lower_body(7)
+    # 必须同时满足下面三处一致，否则要么启动报错、要么静默错位：
+    #   1) 数据侧：本文件 model.processor.action_state_merger 引用的
+    #      configs/data/parts_meta/r1pro.yaml —— merge_spec 把 left_arm(7)/left_ee_pose(9)
+    #      归并成 left_control(9)，right 侧同理，lower_body(7)/torso(4) 归并成 lower_body(7)；
+    #   2) 模型侧：本文件 model.model_arch.action_dim / proprio_dim = 27
+    #      （注意：src/g05/utils/config/config_validator.py 里那项校验比的是
+    #       model.tokenizer.vq_config.max_action_shape_meta，本文件没有写该键，所以校验被跳过 ——
+    #       这三处的一致性靠人工对齐，写错不一定会立即报错，务必逐个核对）；
+    #   3) 部署侧：ckpt_utils 会把该布局写进运行目录配置，服务端据此把 27 维动作切回各个 part。
     parts_meta:
       left_control: 9
       left_gripper: 1
       right_control: 9
       right_gripper: 1
       lower_body: 7
+
+    # 【码本大小】4096 = 每层码本有 4096 个 codeword，对应动作 token <action0000>…<action4095>。
+    # 与 actioncodec.yaml 的默认值相同，写在这里是把“本任务实际使用的码本规模”记录清楚。
+    # ⚠️ 改动它等价于改变动作 token 的含义，必须用同样的配置重训动作 tokenizer 与 VLA 权重。
     model_arch:
       codebook_size: 4096
+
+# 【顺带算一笔账】按上面的配置，一个动作 chunk（horizon = 32 帧）会编码成多少个 token？
+#   * 3 个神经网络 part（left_control / right_control / lower_body）
+#       × num_residuals 2 × code_len 8   （code_len = code_h 1 × code_a 8，见 actioncodec.yaml 的 model_arch）
+#       = 48
+#   * 2 个夹爪 × 每个 key 2 个规则 token = 4
+#   * 组标记 = 3 个神经网络 part × 2 层 + 2 个夹爪 = 8
+#   合计 60 个 action token（不含组标记时为 48 + 4 = 52）。
+#   开了 dropout_noop_parts 之后实际序列会更短（缺席的 part 不出现在序列中）。
+
+# -----------------------------------------------------------------------------
+# 7. model：训练循环超参 + 本任务的模型/处理器差异
+# -----------------------------------------------------------------------------
+# 读法：本节的“顶层键”（enable_bf16_training / batch_size / learning_rate / …）由
+# scripts/finetune.py 当训练循环超参读取（cfg.model.xxx）；`model_arch` 子树才是真正的
+# 模型定义，会被 hydra.utils.instantiate() 展开成 G05PolicyQwen35(**model_arch)。
 model:
+  # 【数值精度】false = 覆盖 g05.yaml 里的 true ⇒ 本任务整网按 fp32 训练（不启用 bf16 autocast）。
+  # 更慢、更占显存，但对数值敏感的动作专家 / 线性注意力（SSM）参数更稳。
+  # 想提速省显存可以改成 true（g05.yaml 的默认值即 true），代价是收敛曲线可能略有变化。
   enable_bf16_training: false
+  # 【8bit AdamW 优化器】true 时用 bitsandbytes 的 AdamW8bit，优化器状态显存约降 4 倍；
+  # 与 configs/train.yaml 的 use_fused_optimizer 互斥（同时开会直接报错）。
+  # 本任务关闭，与 g05.yaml 默认一致；单卡显存紧张时才有必要开。
   use_8bit_optimizer: false
+  # 【基础学习率】模型按参数组分档（G05Policy.get_optim_param_groups）：
+  #   action_expert（动作专家）= lr                        = 4e-5
+  #   VLM / 主干               = lr × backbone_lr_multiplier  （默认 1.0 ⇒ 4e-5）
+  #   视觉塔                   = lr × backbone_lr_multiplier × vision_lr_multiplier
+  # ⚠️ 注意 backbone_lr_multiplier / vision_lr_multiplier 是从 `cfg.model` 根层读取的
+  #    （scripts/finetune.py 调用 get_optim_param_groups(...) 时传入），而 g05.yaml 和本文件
+  #    把它们写在 model.model_arch 下 —— 细节见下面 model_arch.vision_lr_multiplier 处的说明。
   learning_rate: 4.0e-05
+  # 单卡 micro-batch。全局 batch = batch_size × GPU 数 × grad_accumulation_steps。
+  # 显存不足时优先降这个（例如 8 → 4），再考虑开 checkpoint_vlm / 换 8bit 优化器。
   batch_size: 8
+  # DataLoader 的取数进程数与预取批次数：R1 Pro 数据集的图像解码较重，
+  # 这里给到 16 个 worker + 4 批预取，避免 GPU 等数据（内存/文件句柄吃紧就往下降）。
   num_workers: 16
   prefetch_factor: 4
+  # 【训练长度】max_epochs 与 max_steps 互斥（同时设置会在 finetune.py 里 assert 失败）：
+  #   max_steps = ceil(len(train_dataloader) / grad_accumulation_steps × max_epochs)
+  # 本任务按 epoch 计数（跑满 10 个 epoch），max_steps: null 在这里只是显式声明“不按步数停”。
   max_epochs: 10
   max_steps: null
+  # 【预热步数的两种写法】只要 warmup_ratio 非 null，就会覆盖下面的 warmup_steps
+  # （finetune.py 会算 warmup_steps = int(max_steps × warmup_ratio)）。
+  # R1 Pro 想要固定的 200 步预热，所以这里显式置 null —— 这是与 g05.yaml 默认值（0.05）不同的关键一处。
   warmup_ratio: null
   warmup_steps: 200
+  # 调度器类型：cosine = 先线性预热 200 步，再按余弦衰减。
+  # 由于 lr_min_ratio = 0.0，这里走的是 diffusers 的标准 cosine（一路衰减到 0）；
+  # 仓库自定义的 warmup_constant_cosine（预热 → 恒定 → 余弦）只有在 lr_min_ratio > 0 时
+  # 才由 _get_cosine_schedule_with_min_lr 接管，因此本任务用不到下面的 constant_end_ratio。
   lr_scheduler_type: cosine
+  # 余弦末端的最低学习率比例：0.0 = 衰减到 0（而不是 0.1×lr）。
   lr_min_ratio: 0.0
+  # 【仅 warmup_constant_cosine 会读取】“恒定段”结束位置占总步数的比例。
+  # 本任务用的是 cosine，所以该键当前不生效（保留值，避免与其它 task 的写法产生歧义）。
   constant_end_ratio: 0.08
+  # 权重衰减：比 g05.yaml 的 0.01 更重（0.03），用于抑制关节空间微调时的过拟合。
+  # Adam 的 betas 未在此覆盖 ⇒ 沿用 g05.yaml 的 (0.9, 0.95)。
   weight_decay: 0.03
+
+  # 【数据处理管线差异】本节的最终值会和 configs/data/r1pro.yaml 里的 processors 合并，
+  # 合并规则见 src/g05/utils/data/processor_utils.py 的 build_processors：
+  #   merged = merge(data 侧处理器字段, 本文件 model.processor)
+  # task 级（本文件）优先；其中 action_state_merger 是“整体替换”而不是逐键合并。
   processor:
+    # 【喂给 VLM / 动作 tokenizer 的动作是否再走一套独立归一化】
+    # null = 不做，直接使用主归一化（action 归一化）之后的动作。
+    # 只有显式给出模式（例如 q01/q99）时，BaseProcessor 才会额外构造
+    # _vlm_input_action_normalizer 并对动作单独归一化一遍。
     vlm_input_action_norm_default_mode: null
     vlm_input_action_norm_exception_mode: null
+    # tokenizer 加载参数：local_files_only=true ⇒ 只用本地 HF 缓存里的 tokenizer，不联网。
+    # 集群、内网、评测机都推荐这样，避免启动时卡在下载上。
     tokenizer_params:
       local_files_only: true
+    # 【每路相机的目标分辨率】exterior（头部/外部视角）/ wrist_left / wrist_right 统一 256×256。
+    # 与 g05.yaml 的默认值相同，写出来是为了让本任务自解释：
+    # 该表按 camera_type 索引，processor 会据此自动给每路相机注入 Resize，
+    # 并覆盖 configs/data/r1pro.yaml 里 shape_meta 中写的 224×224（启动时会打印 stale 警告，属正常）。
     camera_size_config:
       exterior:
       - 256
@@ -73,22 +317,101 @@ model:
       wrist_right:
       - 256
       - 256
+    # 【动作维度过滤器】DummyActionFilter = 把所有动作维度都视为“可操作”
+    # （action_op_mask 全 True，不屏蔽任何维度）。数据侧默认的 BaseActionFilter 语义相同，
+    # 这里显式换成 Dummy 版本，表达“R1 Pro 的 27 维全部参与训练与下发”。
     action_filter:
       _target_: g05.data_processor.transforms.action_filter.DummyActionFilter
+    # 【动作/状态合并器】把按语义分组的字典（left_arm / left_ee_pose / left_gripper / …）
+    # 对齐并拼成固定宽度的扁平张量，同时给出 padding mask。
+    # GroupedPaddingMerger 做两级合并：
+    #   第一级：按 merge_spec 在互斥的候选键里取“存在的那个”（left_arm 或 left_ee_pose），
+    #           并填充到这些候选键的最大宽度；
+    #   第二级：按 parts_meta 的顺序拼接成固定维度向量。
+    # 结果 = 27 维：left_control(9) | left_gripper(1) | right_control(9) | right_gripper(1) | lower_body(7)
+    # ⚠️ ① 下面三个 ${oc.load:...} 指向 configs/data/parts_meta/r1pro.yaml，必须与上面
+    #      tokenizer.vq_config.parts_meta 语义一致，否则 token 与动作向量会静默错位；
+    #    ② 整个 action_state_merger 会替换数据侧的同名配置（不逐键合并），所以
+    #      configs/data/r1pro.yaml 里那份 PaddingActionMerger + 10k_wbc.yaml 在 r1pro 训练时不生效。
     action_state_merger:
       _target_: g05.data_processor.transforms.action_state_merger.GroupedPaddingMerger
       max_action_shape_meta: ${oc.load:configs/data/parts_meta/r1pro.yaml,parts_meta}
       max_state_shape_meta: ${oc.load:configs/data/parts_meta/r1pro.yaml,parts_meta}
       merge_spec: ${oc.load:configs/data/parts_meta/r1pro.yaml,merge_spec}
+      # merge: true → 合并结果是一个张量；false 则保持 dict（逐键仍会被对齐）
       merge: true
+
+  # 【模型结构子树】会被整棵传给 G05PolicyQwen35(**model_arch)，完整字段见 configs/model/g05.yaml；
+  # 这里只列出与 R1 Pro 相关的差异项。
   model_arch:
+    # 【视觉塔学习率倍率】意图是让视觉塔 lr = lr × backbone_lr_multiplier × vision_lr_multiplier，
+    # 用 0.1 少改动预训练的视觉特征。
+    # ⚠️ 但 scripts/finetune.py 读取的是 cfg.model.vision_lr_multiplier（model 组根层），
+    #    本键位于 model.model_arch 之下，因此当前不会被读取 ⇒ 视觉塔实际仍按 lr × 1.0 × 1.0 训练。
+    #    确实想给视觉塔打折时，需要在 `model:` 下（processor 那一层）再补一行 `vision_lr_multiplier: 0.1`；
+    #    backbone_lr_multiplier 同理，只有写在 model 根层才会生效（g05.yaml 里的那份写在 model_arch 下）。
     vision_lr_multiplier: 0.1
+    # 【动作维度 / 本体感受维度】27 = 9 + 1 + 9 + 1 + 7，覆盖 g05.yaml 的默认值 20。
+    # 必须与 tokenizer.vq_config.parts_meta 之和、以及数据侧 GroupedPaddingMerger 的输出宽度一致；
+    # ⚠️ config_validator 比的是 tokenizer.vq_config.max_action_shape_meta（本文件未写该键 ⇒ 跳过校验），
+    #    所以这里改错时不一定立刻报错，可能表现为训练 loss 异常或部署时动作错位。
     action_dim: 27
     proprio_dim: 27
+    # 【Flow Matching 分支】num_flow_samples: 4 = 每个样本额外采样 4 组噪声/时间点做 FM 回归
+    # （动作专家侧的等效 batch 变成 4×B），loss 更平滑、训练更稳，代价是显存与耗时上升；
+    # g05.yaml 的默认值是 1。显存紧张时可先降到 2 或 1。
     fm:
       num_flow_samples: 4
+    # 【AR 分支】block_wise_autoregressive: false 必须与 tokenizer.vq_config 里的同名键一致
+    # （G05Policy 会 assert）。R1 Pro 用逐 token 的普通自回归；配合 num_residuals=2 时，
+    # 一个 chunk 约 60 个动作 token（见上面 tokenizer 一节的账）。
     ar:
       block_wise_autoregressive: false
+    # 【是否预测 CoT（思维链）文本】false = 直接由图像 + 指令生成动作，不先生成文字推理。
+    # g05.yaml 默认也是 false，这里显式写出以表明本任务不走 CoT（与下面的 pred_eov 配套）。
     predict_cot: false
     input_preprocessor:
+      # 【是否预测 EOV（vision 结束）标记】false = 不预测 EOV；CoT 类任务（如 configs/task/bridge.yaml）
+      # 才需要 true。它与 predict_cot 保持一致。
       pred_eov: false
+
+# =============================================================================
+# 【本文件没有写、但由上游/下游决定的关键取值】（改动前先看这里，避免“改了没效果”）
+# -----------------------------------------------------------------------------
+# 键                                    | 生效值 / 来源
+# --------------------------------------|----------------------------------------
+# model.pretrained_ckpt                 | checkpoints/g05-base/checkpoints/model_state_dict.pt
+#                                       | （g05.yaml 默认；只取权重，优化器/step 从 0 开始）
+# model.use_pretrained_norm_stats        | false（g05.yaml）⇒ 用训练集现场统计归一化量
+# data.action_size / obs_size           | 32 / 1（configs/data/r1pro.yaml）
+#                                       | ⇒ model_arch.horizon_steps=32、cond_steps=1
+# model_arch.max_chunk_token_length     | 1200（g05.yaml），足够放下 prefix + 60 个动作 token
+# model_arch.discrete/continuous_action | true / true ⇒ AR 与 FM 两条路径都训练、都能用于推理
+# model.betas / grad_accumulation_steps | (0.9, 0.95) / 1（均继承 g05.yaml）
+# checkpointing_steps / eval_steps      | 2000 / 100（configs/train.yaml）
+# exp_name / output_dir                 | ${G05_OUTPUT_DIR}/r1pro/${exp_name}
+#
+# 【常见改动速查】
+#   换数据目录            → configs/data/r1pro.yaml（改 dataset_groups[].dataset_dirs）
+#   改 batch / lr / epoch → 本文件 model.batch_size / model.learning_rate / model.max_epochs
+#   显存不足              → 降 model.batch_size；或打开梯度检查点的
+#                           model_arch.checkpoint_vlm / checkpoint_action_expert
+#                           （checkpoint_vision 在 g05.yaml 里已默认开启）；
+#                           或 model.use_8bit_optimizer=true；或把 model_arch.fm.num_flow_samples 降回 1
+#   改相机数量/分辨率      → configs/data/r1pro.yaml 的 shape_meta.images + 本文件
+#                           model.processor.num_output_cameras / num_input_cameras / camera_size_config
+#   改 27 维布局          → 三处同步：configs/data/parts_meta/r1pro.yaml、tokenizer.vq_config.parts_meta、
+#                           model_arch.action_dim / proprio_dim（改完必须重训 tokenizer + VLA）
+#   日志平台 / 离线        → 本文件 logger.*（type / mode / workspace）
+#   只跑通流程            → bash scripts/run/finetune.sh 1 r1pro --test --max_datasets 1 model.max_steps=10
+#
+# 【改动风险速查】
+#   * 改 tokenizer.vq_config 的 parts_meta / num_residuals / use_group_markers / dropout_noop_parts
+#     ⇒ 动作 token 的数量或含义发生变化 ⇒ 旧的动作 tokenizer 权重与旧的 VLA checkpoint 都不再兼容，
+#       必须重新训练动作 tokenizer，并重训（或转换）VLA 权重。
+#   * 改 block_wise_autoregressive ⇒ 必须两处同步改（tokenizer.vq_config 与 model_arch.ar），
+#     否则启动时会直接断言失败。
+#   * 改 action_dim / proprio_dim ⇒ 会重建动作投影与 proprio 编码器，与已有 checkpoint 不兼容。
+#   * 改 max_epochs 或 max_steps ⇒ 学习率曲线（warmup + cosine）按总步数计算，
+#     请只保留其中一个，另一个显式置 null。
+# =============================================================================
